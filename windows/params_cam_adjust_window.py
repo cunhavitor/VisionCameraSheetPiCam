@@ -3,27 +3,28 @@ import os
 import json
 import cv2
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QFrame, QWidget
 )
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QKeySequence, QShortcut
 from picamera2 import Picamera2
-from widgets.custom_widgets import LabelNumeric, ButtonMain, ImageLabel
+from widgets.custom_widgets import LabelNumeric, ButtonMain, ImageLabel, Switch, TitleLabelMain
 
 
 class CameraAdjustParamsWindow(QDialog):
     def __init__(self, parent=None, picam2=None):
         super().__init__(parent)
         self.setWindowTitle("Ajuste da PiCam")
-        self.setFixedSize(1400, 700)
-
-        # Centralizar a janela
-        screen = self.screen().availableGeometry()
-        x = (screen.width() - self.width()) // 2
-        y = (screen.height() - self.height()) // 2
-        self.move(x, y)
+        # Tema escuro consistente
+        self.setStyleSheet("background-color: #121212; color: #f0f0f0;")
+        self.resize(1400, 800)
 
         self.picam2 = picam2
+        # Estados de UI/câmara
+        self.ae_enabled = False
+        self.awb_enabled = False
+        self.show_grid = False
+        self._dirty = False
 
         # Caminho do ficheiro de parâmetros
         self.params_path = os.path.join("config", "camera_params.json")
@@ -31,70 +32,126 @@ class CameraAdjustParamsWindow(QDialog):
 
         # Layout principal vertical
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(30,30,30,30)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # Título
+        main_layout.addWidget(TitleLabelMain("Ajuste da PiCam"))
 
         # ---------------- Parte de cima: controles + imagem ----------------
         top_layout = QHBoxLayout()
         main_layout.addLayout(top_layout, 1)
 
-        # ---------------- Frame esquerdo: controles ----------------
-        controls_layout = QVBoxLayout()
-        top_layout.addLayout(controls_layout, 0)
+        # ---------------- Painel esquerdo: controles (card) ----------------
+        left_card = QFrame()
+        left_card.setStyleSheet("background:#1e1e1e; border:1px solid #333333; border-radius:8px;")
+        controls_layout = QVBoxLayout(left_card)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        controls_layout.setSpacing(10)
+        top_layout.addWidget(left_card, 0)
 
         # Widgets numéricos
         self.exposure_spin = LabelNumeric("Exposure (µs)", value=20000, step=100, minimum=1000, maximum=100000, is_float=False)
         self.exposure_spin.valueChanged_connect(lambda val: self.update_camera("exposure", val))
+        self.exposure_spin.setToolTip("Tempo de exposição em µs. Desative AE para editar.")
 
         self.gain_spin = LabelNumeric("Analogue Gain", value=1.0, step=0.1, minimum=1.0, maximum=10.0, is_float=True)
         self.gain_spin.valueChanged_connect(lambda val: self.update_camera("gain", val))
+        self.gain_spin.setToolTip("Ganho analógico. Desative AE para editar.")
 
         self.brightness_spin = LabelNumeric("Brightness", value=0.0, step=0.1, minimum=-1.0, maximum=1.0, is_float=True)
         self.brightness_spin.valueChanged_connect(lambda val: self.update_camera("brightness", val))
+        self.brightness_spin.setToolTip("Brilho global da imagem.")
 
         self.contrast_spin = LabelNumeric("Contrast", value=1.0, step=0.1, minimum=0.0, maximum=3.0, is_float=True)
         self.contrast_spin.valueChanged_connect(lambda val: self.update_camera("contrast", val))
+        self.contrast_spin.setToolTip("Contraste global da imagem.")
 
         self.red_gain_spin = LabelNumeric("Red Gain", value=1.5, step=0.1, minimum=0.0, maximum=4.0, is_float=True)
         self.red_gain_spin.valueChanged_connect(lambda val: self.update_camera("red_gain", val))
+        self.red_gain_spin.setToolTip("Ganho do canal R. Desative AWB para editar.")
 
         self.blue_gain_spin = LabelNumeric("Blue Gain", value=1.5, step=0.1, minimum=0.0, maximum=4.0, is_float=True)
         self.blue_gain_spin.valueChanged_connect(lambda val: self.update_camera("blue_gain", val))
+        self.blue_gain_spin.setToolTip("Ganho do canal B. Desative AWB para editar.")
 
-        controls_layout.addSpacing(30)
+        # Switches AE/AWB e grelha
+        self.switch_ae = Switch("Auto Exposure (AE)")
+        self.switch_ae.setChecked(False)
+        self.switch_ae.stateChanged.connect(self._toggle_ae)
+
+        self.switch_awb = Switch("Auto White Balance (AWB)")
+        self.switch_awb.setChecked(False)
+        self.switch_awb.stateChanged.connect(self._toggle_awb)
+
+        self.switch_grid = Switch("Mostrar grelha 3x3")
+        self.switch_grid.setChecked(False)
+        self.switch_grid.stateChanged.connect(self._toggle_grid)
+
+        # Histograma ao vivo (toggle)
+        self.switch_hist = Switch("Mostrar histograma")
+        self.switch_hist.setChecked(True)
+        self.switch_hist.stateChanged.connect(lambda on: self.hist_label.setVisible(bool(on)))
+
+        controls_layout.addSpacing(10)
         for widget in [
-            self.exposure_spin, self.gain_spin, self.brightness_spin,
-            self.contrast_spin, self.red_gain_spin, self.blue_gain_spin
+            self.switch_ae,
+            self.exposure_spin,
+            self.gain_spin,
+            self.brightness_spin,
+            self.contrast_spin,
+            self.switch_awb,
+            self.red_gain_spin,
+            self.blue_gain_spin,
+            self.switch_grid,
+            # toggle histograma
+            self.switch_hist if hasattr(self, 'switch_hist') else None,
         ]:
-            controls_layout.addWidget(widget)
+            if widget is not None:
+                controls_layout.addWidget(widget)
 
         # Botões
-        controls_layout.addSpacing(30)
-        save_button = ButtonMain("💾 Guardar Parâmetros")
+        controls_layout.addSpacing(20)
+        save_button = ButtonMain("💾 Guardar Parâmetros  (S)")
         save_button.clicked.connect(self.save_params)
         controls_layout.addWidget(save_button)
 
-        reset_button = ButtonMain("🔄 Reset Parâmetros")
+        reset_button = ButtonMain("🔄 Reset Parâmetros  (R)")
         reset_button.clicked.connect(self.reset_params)
         controls_layout.addWidget(reset_button)
 
-        capture_button = ButtonMain("📸 Capturar Foto")
+        capture_button = ButtonMain("📸 Capturar Foto  (C)")
         capture_button.clicked.connect(self.capture_frame)
         controls_layout.addWidget(capture_button)
 
-        save_button_img = ButtonMain("💾 Guardar Foto")
-        save_button_img.clicked.connect(self.save_frame)
-        controls_layout.addWidget(save_button_img)
+        self.save_button_img = ButtonMain("💾 Guardar Foto  (G)")
+        self.save_button_img.clicked.connect(self.save_frame)
+        self.save_button_img.setEnabled(False)
+        controls_layout.addWidget(self.save_button_img)
 
-        resume_button = ButtonMain("▶️ Voltar ao Live")
+        resume_button = ButtonMain("▶️ Voltar ao Live  (L)")
         resume_button.clicked.connect(self.resume_live)
         controls_layout.addWidget(resume_button)
 
         controls_layout.addStretch()
 
-        # ---------------- Frame direito: imagem ----------------
+        # ---------------- Frame direito: imagem + histograma ----------------
+        right_container = QWidget()
+        right_v = QVBoxLayout(right_container)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(8)
+
         self.image_label = ImageLabel()
+        right_v.addWidget(self.image_label, 1)
+
+        self.hist_label = QLabel()
+        self.hist_label.setFixedHeight(140)
+        self.hist_label.setAlignment(Qt.AlignCenter)
+        self.hist_label.setStyleSheet("border:1px solid #333333; border-radius:6px; background:#0f0f0f;")
+        right_v.addWidget(self.hist_label, 0)
+
         top_layout.addSpacing(50)
-        top_layout.addWidget(self.image_label, 1)
+        top_layout.addWidget(right_container, 1)
 
         # ---------------- Rodapé: status ----------------
         self.status_label = QLabel("[INFO] Modo Live ativo")
@@ -130,6 +187,16 @@ class CameraAdjustParamsWindow(QDialog):
         self.running = True
         self.live_mode = True
 
+        # Atalhos de teclado
+        QShortcut(QKeySequence("S"), self, activated=self.save_params)
+        QShortcut(QKeySequence("R"), self, activated=self.reset_params)
+        QShortcut(QKeySequence("C"), self, activated=self.capture_frame)
+        QShortcut(QKeySequence("G"), self, activated=self.save_frame)
+        QShortcut(QKeySequence("L"), self, activated=self.resume_live)
+        QShortcut(QKeySequence("A"), self, activated=lambda: self.switch_ae.setChecked(not self.switch_ae.isChecked()))
+        QShortcut(QKeySequence("W"), self, activated=lambda: self.switch_awb.setChecked(not self.switch_awb.isChecked()))
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.close)
+
     # ---------------- Métodos ----------------
     def safe_set_controls(self, controls):
         try:
@@ -147,7 +214,9 @@ class CameraAdjustParamsWindow(QDialog):
                 "AnalogueGain": 1.0,
                 "Brightness": 0.0,
                 "Contrast": 1.0,
-                "ColourGains": [1.0, 1.0]
+                "ColourGains": [1.0, 1.0],
+                "AeEnable": False,
+                "AwbEnable": False
             }
 
         self.exposure_spin.setValue(params.get("ExposureTime", 10000))
@@ -157,6 +226,22 @@ class CameraAdjustParamsWindow(QDialog):
         self.red_gain_spin.setValue(params.get("ColourGains", [1.0, 1.0])[0])
         self.blue_gain_spin.setValue(params.get("ColourGains", [1.0, 1.0])[1])
 
+        # Atualiza AE/AWB a partir do JSON sem disparar sinais duplicados
+        ae = bool(params.get("AeEnable", False))
+        awb = bool(params.get("AwbEnable", False))
+        if hasattr(self, 'switch_ae'):
+            self.switch_ae.blockSignals(True)
+            self.switch_ae.setChecked(ae)
+            self.switch_ae.blockSignals(False)
+            self.ae_enabled = ae
+        if hasattr(self, 'switch_awb'):
+            self.switch_awb.blockSignals(True)
+            self.switch_awb.setChecked(awb)
+            self.switch_awb.blockSignals(False)
+            self.awb_enabled = awb
+
+        # Aplicar estado AE/AWB e reenviar valores atuais
+        self._apply_ae_awb_state()
         self.update_camera("exposure", self.exposure_spin.value())
         self.update_camera("gain", self.gain_spin.value())
         self.update_camera("brightness", self.brightness_spin.value())
@@ -169,23 +254,31 @@ class CameraAdjustParamsWindow(QDialog):
             return
         frame = self.picam2.capture_array()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_RGB888)
-        self.image_label.set_image(QPixmap.fromImage(image))
+        pix = self._to_pixmap_with_overlay(frame)
+        self.image_label.set_image(pix)
+        # Atualiza histograma se ativo
+        if hasattr(self, 'switch_hist') and self.switch_hist.isChecked():
+            self._update_histogram(frame)
 
     def update_camera(self, param, value):
         value = float(value)
+        self._mark_dirty()
         if param == "exposure":
-            self.safe_set_controls({"AeEnable": False, "ExposureTime": int(value)})
+            if not self.ae_enabled:
+                self.safe_set_controls({"AeEnable": False, "ExposureTime": int(value)})
         elif param == "gain":
-            self.safe_set_controls({"AnalogueGain": value})
+            if not self.ae_enabled:
+                self.safe_set_controls({"AnalogueGain": value})
         elif param == "brightness":
             self.safe_set_controls({"Brightness": value})
         elif param == "contrast":
             self.safe_set_controls({"Contrast": value})
         elif param == "red_gain":
-            self.safe_set_controls({"AwbEnable": False, "ColourGains": (value, self.blue_gain_spin.value())})
+            if not self.awb_enabled:
+                self.safe_set_controls({"AwbEnable": False, "ColourGains": (value, self.blue_gain_spin.value())})
         elif param == "blue_gain":
-            self.safe_set_controls({"AwbEnable": False, "ColourGains": (self.red_gain_spin.value(), value)})
+            if not self.awb_enabled:
+                self.safe_set_controls({"AwbEnable": False, "ColourGains": (self.red_gain_spin.value(), value)})
 
     def save_params(self):
         params = {
@@ -193,12 +286,15 @@ class CameraAdjustParamsWindow(QDialog):
             "AnalogueGain": float(self.gain_spin.value()),
             "Brightness": float(self.brightness_spin.value()),
             "Contrast": float(self.contrast_spin.value()),
-            "ColourGains": [float(self.red_gain_spin.value()), float(self.blue_gain_spin.value())]
+            "ColourGains": [float(self.red_gain_spin.value()), float(self.blue_gain_spin.value())],
+            "AeEnable": bool(self.ae_enabled),
+            "AwbEnable": bool(self.awb_enabled)
         }
         with open(self.params_path, "w") as f:
             json.dump(params, f, indent=4)
         print(f"[INFO] Parâmetros guardados em {self.params_path}")
         self.status_label.setText("[INFO] Parâmetros guardados com sucesso.")
+        self._dirty = False
 
     def reset_params(self):
         reply = QMessageBox.question(
@@ -213,7 +309,9 @@ class CameraAdjustParamsWindow(QDialog):
                 "AnalogueGain": 1.0,
                 "Brightness": 0.0,
                 "Contrast": 1.0,
-                "ColourGains": [1.0, 1.0]
+                "ColourGains": [1.0, 1.0],
+                "AeEnable": False,
+                "AwbEnable": False
             }
             with open(self.params_path, "w") as f:
                 json.dump(defaults, f, indent=4)
@@ -230,10 +328,13 @@ class CameraAdjustParamsWindow(QDialog):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         self.captured_frame = frame.copy()
-        image = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_RGB888)
-        self.image_label.set_image(QPixmap.fromImage(image))
+        pix = self._to_pixmap_with_overlay(frame)
+        self.image_label.set_image(pix)
         self.live_mode = False
         self.status_label.setText("[CAPTURA] Frame congelado.")
+        self.save_button_img.setEnabled(True)
+        if hasattr(self, 'switch_hist') and self.switch_hist.isChecked():
+            self._update_histogram(frame)
 
     def save_frame(self):
         if hasattr(self, "captured_frame") and self.captured_frame is not None:
@@ -252,6 +353,7 @@ class CameraAdjustParamsWindow(QDialog):
             self.picam2.stop()
             self.picam2.configure(self.preview_config)
             self.picam2.start()
+            self.save_button_img.setEnabled(False)
         else:
             self.status_label.setText("[WARN] Nenhum frame capturado para guardar.")
 
@@ -260,6 +362,7 @@ class CameraAdjustParamsWindow(QDialog):
             self.timer.start(50)
             self.live_mode = True
             self.status_label.setText("[LIVE] Stream retomado.")
+            self.save_button_img.setEnabled(False)
 
     def closeEvent(self, event):
         if hasattr(self, "timer") and self.timer.isActive():
@@ -267,3 +370,88 @@ class CameraAdjustParamsWindow(QDialog):
         if self.picam2:
             self.picam2.stop()
         event.accept()
+
+    # ---------------- Helpers e estados ----------------
+    def _toggle_ae(self, enabled: bool):
+        self.ae_enabled = bool(enabled)
+        self._apply_ae_awb_state()
+        # Desativar/ativar controlos relacionados
+        self.exposure_spin.setEnabled(not self.ae_enabled)
+        self.gain_spin.setEnabled(not self.ae_enabled)
+        self.status_label.setText(f"[INFO] AE {'ativado' if self.ae_enabled else 'desativado'}.")
+
+    def _toggle_awb(self, enabled: bool):
+        self.awb_enabled = bool(enabled)
+        self._apply_ae_awb_state()
+        self.red_gain_spin.setEnabled(not self.awb_enabled)
+        self.blue_gain_spin.setEnabled(not self.awb_enabled)
+        self.status_label.setText(f"[INFO] AWB {'ativado' if self.awb_enabled else 'desativado'}.")
+
+    def _apply_ae_awb_state(self):
+        # Aplica estado aos controlos da câmera
+        self.safe_set_controls({"AeEnable": bool(self.ae_enabled)})
+        self.safe_set_controls({"AwbEnable": bool(self.awb_enabled)})
+        # Se AE/AWB estiverem off, reenvia manuais atuais
+        if not self.ae_enabled:
+            self.safe_set_controls({
+                "ExposureTime": int(self.exposure_spin.value()),
+                "AnalogueGain": float(self.gain_spin.value()),
+            })
+        if not self.awb_enabled:
+            self.safe_set_controls({
+                "ColourGains": (float(self.red_gain_spin.value()), float(self.blue_gain_spin.value()))
+            })
+
+    def _toggle_grid(self, enabled: bool):
+        self.show_grid = bool(enabled)
+        self.status_label.setText(f"[INFO] Grelha {'ativada' if self.show_grid else 'desativada'}.")
+
+    def _to_pixmap_with_overlay(self, frame_rgb):
+        """Converte numpy RGB em QPixmap e desenha grelha 3x3 opcional."""
+        h, w, ch = frame_rgb.shape
+        qimg = QImage(frame_rgb.data, w, h, int(frame_rgb.strides[0]), QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        if self.show_grid:
+            pix = pix.copy()
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor(255, 255, 255, 120))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            # 3x3 grid (regra dos terços)
+            x1 = w // 3
+            x2 = 2 * w // 3
+            y1 = h // 3
+            y2 = 2 * h // 3
+            painter.drawLine(x1, 0, x1, h)
+            painter.drawLine(x2, 0, x2, h)
+            painter.drawLine(0, y1, w, y1)
+            painter.drawLine(0, y2, w, y2)
+            painter.end()
+        return pix
+
+    def _update_histogram(self, frame_rgb):
+        try:
+            import numpy as np
+            hist_h, hist_w = 120, 256
+            canvas = np.zeros((hist_h, hist_w, 3), dtype=np.uint8)
+            # R, G, B channels
+            colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # BGR for cv2
+            for ch in range(3):
+                hist = cv2.calcHist([frame_rgb], [ch], None, [256], [0, 256]).flatten()
+                if hist.max() > 0:
+                    hist = hist / hist.max()
+                hist = (hist * (hist_h - 10)).astype(int)
+                for x in range(1, 256):
+                    y1 = hist_h - 1 - hist[x - 1]
+                    y2 = hist_h - 1 - hist[x]
+                    cv2.line(canvas, (x - 1, y1), (x, y2), colors[ch], 1)
+            qimg = QImage(canvas.data, hist_w, hist_h, int(canvas.strides[0]), QImage.Format_RGB888)
+            self.hist_label.setPixmap(QPixmap.fromImage(qimg))
+        except Exception:
+            pass
+
+    def _mark_dirty(self):
+        if not self._dirty:
+            self._dirty = True
+            self.status_label.setText("[EDIT] Alterações não guardadas (S para guardar).")

@@ -363,7 +363,7 @@ class InspectionWindow(QDialog):
             cv2.drawContours(img_to_show, draw_contours, -1, (0, 0, 255), 2)
         img_rgb = cv2.cvtColor(img_to_show, cv2.COLOR_BGR2RGB)
         h, w, ch = img_rgb.shape
-        qimg = QImage(img_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        qimg = QImage(img_rgb.data, w, h, int(img_rgb.strides[0]), QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
         pixmap = pixmap.scaled(self.frame_img.width(), self.frame_img.height(), Qt.KeepAspectRatio)
         self.frame_img.setPixmap(pixmap)
@@ -543,10 +543,9 @@ class InspectionWindow(QDialog):
     def _show_defects(self):
         total_start = time.perf_counter()
 
-        # (Opcional) garantir OpenCV otimizado
         try:
             cv2.setUseOptimized(True)
-            cv2.setNumThreads(4)   # Pi 5 tem 4 cores
+            cv2.setNumThreads(4)
         except Exception:
             pass
 
@@ -555,16 +554,25 @@ class InspectionWindow(QDialog):
         self.current_full = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
 
-        # 2) Alinhamento full-res (fallback se falhar)
+        # 2) Alinhamento (current -> template). Mantém também a H.
+        H = None
         try:
-            self.aligned_full, M = align_with_template(self.current_full, self.template_full)
-            if self.aligned_full is None:
+            self.aligned_full, H = align_with_template(self.current_full, self.template_full)
+            if self.aligned_full is None or H is None:
                 raise ValueError("Falhou alinhamento")
         except Exception as e:
             print("⚠️ Erro no alinhamento, usando imagem original:", e)
             self.aligned_full = self.current_full.copy()
+            # Homografia identidade como fallback (desenha sem reprojetar)
+            H = np.eye(3, dtype=np.float32)
 
-        # 3) ROI da máscara (calcula uma vez e guarda)
+        # Inversa: template -> current (para reprojetar desenho)
+        try:
+            H_inv = np.linalg.inv(H)
+        except Exception:
+            H_inv = np.eye(3, dtype=np.float32)
+
+        # 3) ROI da máscara (cálculo/uso)
         if not hasattr(self, "_mask_bbox"):
             nz = cv2.findNonZero(self.mask_full)
             if nz is None:
@@ -575,12 +583,12 @@ class InspectionWindow(QDialog):
         else:
             x0, y0, w0, h0 = self._mask_bbox
 
-        # 4) Recortes ROI (full-res)
-        tpl_roi   = self.template_full[y0:y0+h0, x0:x0+w0]
-        cur_roi   = self.aligned_full[y0:y0+h0, x0:x0+w0]
-        mask_roi  = self.safe_mask[y0:y0+h0, x0:x0+w0]
+        # 4) Recortes ROI no espaço do TEMPLATE (porque aligned_full está nesse espaço)
+        tpl_roi  = self.template_full[y0:y0+h0, x0:x0+w0]
+        cur_roi  = self.aligned_full[y0:y0+h0, x0:x0+w0]
+        mask_roi = self.safe_mask[y0:y0+h0, x0:x0+w0]
 
-        # aplicar máscara e normalizar a fotometria no ROI (condicional, igual ao Tuner)
+        # Normalização fotométrica condicional (como no Tuner)
         tpl_masked_roi = cv2.bitwise_and(tpl_roi, tpl_roi, mask=mask_roi)
         cur_masked_roi = cv2.bitwise_and(cur_roi, cur_roi, mask=mask_roi)
         tpl_mean = cv2.mean(cv2.cvtColor(tpl_masked_roi, cv2.COLOR_BGR2GRAY), mask=mask_roi)[0]
@@ -588,7 +596,7 @@ class InspectionWindow(QDialog):
         if abs(tpl_mean - ali_mean) > 1.0:
             cur_masked_roi = self._normalize_lab_to_template(tpl_masked_roi, cur_masked_roi, mask_roi)
 
-        # 5) Deteção de defeitos (só no ROI)
+        # 5) Deteção de defeitos (em coords do TEMPLATE/ROI)
         t_det = time.perf_counter()
         result = detect_defects(
             tpl_masked_roi, cur_masked_roi, mask_roi,
@@ -621,15 +629,30 @@ class InspectionWindow(QDialog):
             w_color=self.w_color,
             fused_percentile=self.fused_percentile,
         )
-        # Aceita 6 (sem msssim) ou 7 valores (com msssim)
         if len(result) == 7:
             final_mask, contours_roi, darker_mask_roi, brighter_mask_roi, blue_mask_roi, red_mask_roi, _ = result
         else:
             final_mask, contours_roi, darker_mask_roi, brighter_mask_roi, blue_mask_roi, red_mask_roi = result
 
-        # print(f"[Tempo] detect_defects(ROI): {time.perf_counter()-t_det:.4f}s")
+        # 6) Preparar visualizações sobre a IMAGEM ORIGINAL (sem warp)
+        gray_full = cv2.cvtColor(self.current_full, cv2.COLOR_BGR2GRAY)
+        vis_bw    = cv2.cvtColor(gray_full, cv2.COLOR_GRAY2BGR)
+        vis_color = self.current_full.copy()
 
-        # 6) Classificação por tipo + conversão para coords full-frame
+        # helpers para reprojetar um ponto e um raio
+        def _warp_point_T2C(Hinv, x_t, y_t):
+            v = np.array([x_t, y_t, 1.0], dtype=np.float32)
+            w = Hinv @ v
+            w /= (w[2] + 1e-12)
+            return float(w[0]), float(w[1])
+
+        def _warp_radius_T2C(Hinv, cx_t, cy_t, r_t):
+            # aproxima o raio transformando um ponto deslocado no template
+            x2_t, y2_t = cx_t + r_t, cy_t
+            cx_c, cy_c = _warp_point_T2C(Hinv, cx_t, cy_t)
+            x2_c, y2_c = _warp_point_T2C(Hinv, x2_t, y2_t)
+            return max(1.0, ((x2_c - cx_c)**2 + (y2_c - cy_c)**2) ** 0.5)
+
         mask_types = {
             "dark":   darker_mask_roi,
             "bright": brighter_mask_roi,
@@ -637,91 +660,84 @@ class InspectionWindow(QDialog):
             "red":    red_mask_roi
         }
         color_map = {
-            "dark":   (0, 255, 0),      # vermelho
-            "bright": (255, 255, 0),    # amarelo
-            "blue":   (0, 0, 255),      # azul
-            "red":    (255, 0, 255)     # roxo
+            "dark":   (0, 255, 0),
+            "bright": (255, 255, 0),
+            "blue":   (0, 0, 255),
+            "red":    (255, 0, 255)
         }
 
-        # base de visualização em B/W (full-res)
-        gray_full = cv2.cvtColor(self.aligned_full, cv2.COLOR_BGR2GRAY)
-        vis_bw    = cv2.cvtColor(gray_full, cv2.COLOR_GRAY2BGR)
-        vis_color = self.aligned_full.copy()
-
         defect_data = []
-        self.defect_contours = []  # guarda também em coords full
+        self.defect_contours = []
 
         for cnt_roi in contours_roi:
-            # bbox no ROI
             xr, yr, wr, hr = cv2.boundingRect(cnt_roi)
-
-            # tipo dominante: usa countNonZero em vez de sum (mais rápido)
+            # tipo dominante no ROI (template-space)
             label = max(
                 mask_types,
                 key=lambda k: cv2.countNonZero(mask_types[k][yr:yr+hr, xr:xr+wr])
             )
             color = color_map[label]
 
-            # círculo mínimo no ROI
+            # círculo mínimo no ROI (template-space)
             (cxr_f, cyr_f), rr_f = cv2.minEnclosingCircle(cnt_roi)
-            cxr, cyr, rr = int(cxr_f), int(cyr_f), int(max(rr_f, 8))
+            cx_t, cy_t, r_t = float(cxr_f + x0), float(cyr_f + y0), float(max(rr_f, 8))
 
-            # converter para coords full-frame (shift pelo offset do ROI)
-            cx = cxr + x0
-            cy = cyr + y0
-            # ampliar o raio para melhor visibilidade
-            r  = max(24, rr + 6)
-            x  = xr + x0
-            y  = yr + y0
-            w  = wr
-            h  = hr
+            # reprojetar centro/raio para CURRENT (sem warp)
+            cx_c, cy_c = _warp_point_T2C(H_inv, cx_t, cy_t)
+            r_c = max(24.0, _warp_radius_T2C(H_inv, cx_t, cy_t, r_t) + 6.0)
 
-            # shift do contorno para full
-            cnt_full = cnt_roi.copy()
-            cnt_full[:, 0, 0] += x0
-            cnt_full[:, 0, 1] += y0
-            self.defect_contours.append(cnt_full)
+            # reprojetar contorno completo para guardar/mostrar (opcional)
+            cnt_full_t = cnt_roi.copy()
+            cnt_full_t[:, 0, 0] += x0
+            cnt_full_t[:, 0, 1] += y0
+            # aplica H_inv
+            pts = cnt_full_t.reshape(-1, 2).astype(np.float32)
+            pts_h = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=np.float32)])
+            pts_c = (pts_h @ H_inv.T)
+            pts_c[:, 0] /= (pts_c[:, 2] + 1e-12)
+            pts_c[:, 1] /= (pts_c[:, 2] + 1e-12)
+            cnt_full_c = pts_c[:, :2].reshape(-1, 1, 2).astype(np.int32)
+            self.defect_contours.append(cnt_full_c)
 
-            # nº da lata (centro do defeito)
+            # desenhar nos visuais (CURRENT)
+            cxi, cyi, ri = int(round(cx_c)), int(round(cy_c)), int(round(r_c))
+            cv2.circle(vis_bw,    (cxi, cyi), ri, color, 3, lineType=cv2.LINE_AA)
+            cv2.circle(vis_bw,    (cxi, cyi), 2,  color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(vis_color, (cxi, cyi), ri, color, 3, lineType=cv2.LINE_AA)
+            cv2.circle(vis_color, (cxi, cyi), 2,  color, -1, lineType=cv2.LINE_AA)
+
+            # nº da lata (encontra por polígono em coords CURRENT)
             lata_id = None
-            pt = Point(cx, cy)
-            # 48 polígonos ⇒ loop simples é rápido; se quiseres, dá para usar STRtree
+            pt = Point(cxi, cyi)
             for pol in self.instancias_poligonos:
-                poly = pol["polygon"]
-                # 'contains' exclui pontos na borda; 'covers' inclui a borda
-                if poly.covers(pt) or poly.distance(pt) <= 2.0:
+                # Polígonos estão em coords do TEMPLATE? Se sim, reprojeta vértices 1x ao arranque.
+                # Supondo que já tens os polígonos em CURRENT, senão comentar…
+                if pol["polygon"].contains(pt) or pol["polygon"].distance(pt) <= 2.0:
                     lata_id = pol["numero_lata"]
                     break
-            # fallback: se ainda None, escolhe o polígono cujo centro é mais próximo
+
             if lata_id is None and self.instancias_poligonos:
                 nearest = min(self.instancias_poligonos,
-                              key=lambda p: (p["center"][0] - cx)**2 + (p["center"][1] - cy)**2)
+                            key=lambda p: (p["center"][0] - cxi)**2 + (p["center"][1] - cyi)**2)
                 lata_id = nearest["numero_lata"]
 
-            # desenhar círculo em B/W
-            cv2.circle(vis_bw,   (cx, cy), r, color, 3, lineType=cv2.LINE_AA)
-            cv2.circle(vis_bw,   (cx, cy), 2, color, -1, lineType=cv2.LINE_AA)
-            cv2.circle(vis_color,(cx, cy), r, color, 3, lineType=cv2.LINE_AA)
-            cv2.circle(vis_color,(cx, cy), 2, color, -1, lineType=cv2.LINE_AA)
             if lata_id is not None:
-                cv2.putText(vis_bw,    f"#{lata_id}", (max(cx - r, 0), max(cy - r - 6, 0)),
+                cv2.putText(vis_bw,    f"#{lata_id}", (max(cxi - ri, 0), max(cyi - ri - 6, 0)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-                cv2.putText(vis_color, f"#{lata_id}", (max(cx - r, 0), max(cy - r - 6, 0)),
+                cv2.putText(vis_color, f"#{lata_id}", (max(cxi - ri, 0), max(cyi - ri - 6, 0)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
             defect_data.append({
                 "lata": lata_id,
                 "tipo": label,
-                "area": round(cv2.contourArea(cnt_full), 2),
-                "bbox": (int(x), int(y), int(w), int(h)),
-                "cx": int(cx), "cy": int(cy), "r": int(r)
+                "area": round(cv2.contourArea(cnt_full_c), 2),
+                "bbox": (int(xr + x0), int(yr + y0), int(wr), int(hr)),  # bbox ainda em template-space, se precisares reprojeta os 4 cantos
+                "cx": int(cxi), "cy": int(cyi), "r": int(ri)
             })
 
-        # 7) UI + resumo + CSV
-        # Mostrar total de latas com pelo menos um defeito (IDs únicos)
+        # 7) Atualiza contadores e UI (igual ao teu)
         can_ids = {d["lata"] for d in defect_data if d.get("lata") is not None}
         cans_with_defects = len(can_ids)
-        # Cumulative counters update
         per_sheet_total = len(self.instancias_poligonos) if hasattr(self, 'instancias_poligonos') else 0
         per_sheet_good = max(0, per_sheet_total - cans_with_defects)
         self.count_sheets += 1
@@ -729,38 +745,22 @@ class InspectionWindow(QDialog):
         self.count_good_cans += per_sheet_good
         self.count_defect_cans += cans_with_defects
         defect_pct = (self.count_defect_cans / self.count_total_cans * 100.0) if self.count_total_cans > 0 else 0.0
-        # Update UI counters
+
         self.systemTotalSheets.set_value(self.count_sheets)
         self.systemTotalCans.set_value(self.count_total_cans)
         self.systemGoodCans.set_value(self.count_good_cans)
         self.systemTotalDefects.set_value(self.count_defect_cans)
         self.systemDefectPercent.set_value(f"{defect_pct:.1f}%")
-        # Atualiza a lista de IDs no painel (ex.: "2, 33, 48")
         ids_text = ", ".join(str(i) for i in sorted(can_ids)) if can_ids else "—"
         self.systemCansDefects.update_value(ids_text)
-        '''for t in ["dark", "bright", "blue", "red"]:
-            print(f"{t}: {sum(1 for d in defect_data if d['tipo'] == t)}")
 
-        try:
-            os.makedirs("data/results", exist_ok=True)
-            with open("data/results/defeitos.csv", "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["lata", "tipo", "area", "bbox", "cx", "cy", "r"])
-                writer.writeheader()
-                writer.writerows(defect_data)
-            # print("[INFO] CSV exportado para data/results/defeitos.csv")
-        except Exception as e:
-            print("❌ Erro ao exportar CSV:", e)'''
-
-        # 8) Mostrar imagem B/W com círculos (full-res)
+        # 8) Mostra sobre o frame ORIGINAL (sem funil)
         self.show_image(vis_bw)
         print(f"[Tempo Total] _show_defects: {time.perf_counter() - total_start:.4f} s")
 
-        # guarda para o toggle
-        self.last_aligned   = self.aligned_full.copy()
+        self.last_aligned   = self.aligned_full.copy()   # ainda guardo, útil p/ debug
         self.last_vis_bw    = vis_bw
         self.last_vis_color = vis_color
-
-        # mostra a B/W com círculos (ou podes chamar _refresh_view() se quiseres respeitar o estado dos switches)
         self._refresh_view()
 
     def open_tuner_window(self):

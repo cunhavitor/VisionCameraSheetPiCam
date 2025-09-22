@@ -164,9 +164,11 @@ class ImageLabel(QLabel):
         self.border_color = border_color
         self.border_width = border_width
         self.border_radius = border_radius
+        self._source_pixmap = None
 
-        # Define tamanho inicial
-        self.setFixedSize(width, height)
+        # Allow dynamic resizing instead of fixed size
+        self.setMinimumSize(width, height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.setStyleSheet(f"""
             border: {self.border_width}px solid {self.border_color};
@@ -184,10 +186,10 @@ class ImageLabel(QLabel):
         self.update_style()
 
     def set_image(self, img):
-        """Recebe numpy array RGB ou QPixmap e ajusta para o tamanho da label (esticada)."""
+        """Recebe numpy array RGB ou QPixmap e ajusta para o tamanho da label."""
         if isinstance(img, np.ndarray):
             h, w, ch = img.shape
-            bytes_per_line = ch * w
+            bytes_per_line = int(img.strides[0])
             qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg)
         elif isinstance(img, QPixmap):
@@ -195,12 +197,22 @@ class ImageLabel(QLabel):
         else:
             raise ValueError("img deve ser numpy array RGB ou QPixmap")
 
-        pixmap = pixmap.scaled(
+        self._source_pixmap = pixmap
+        self._apply_scaled()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._source_pixmap is not None:
+            self._apply_scaled()
+
+    def _apply_scaled(self):
+        if self._source_pixmap is None:
+            return
+        scaled = self._source_pixmap.scaled(
             self.width(), self.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-        self.setPixmap(pixmap)
+        self.setPixmap(scaled)
 
 class SwitchButton(QWidget):
     stateChanged = Signal(bool)
