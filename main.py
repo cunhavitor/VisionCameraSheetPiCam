@@ -12,8 +12,7 @@
 # source venv/bin/activate
 # python main.py
 
-# token
-# ***REMOVED***
+
 
 # -*- coding: utf-8 -*-
 
