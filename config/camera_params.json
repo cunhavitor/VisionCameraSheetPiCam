@@ -1,0 +1,10 @@
+{
+    "ExposureTime": 30800,
+    "AnalogueGain": 1.2,
+    "Brightness": 1.0,
+    "Contrast": 3.0,
+    "ColourGains": [
+        2.2,
+        1.9
+    ]
+}

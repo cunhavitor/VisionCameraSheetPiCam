@@ -1,0 +1,9 @@
+{
+    "gaussian": 1,
+    "treshold1": 98,
+    "treshold2": 1,
+    "kernell": 99,
+    "area_min": 1,
+    "area_max": 27,
+    "circularity_min": 0.1
+}

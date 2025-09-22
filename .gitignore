@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+*.csv
+
+# Data (grande ou gerada)
+data/raw/
+data/results/
+outputs/
+*.jpg
+*.png
+
+# Qt / PySide artefactos
+*.ui~
+*.qrc~

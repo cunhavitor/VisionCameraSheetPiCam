@@ -1,0 +1,6 @@
+{
+  "blur_ksize": 5,
+  "canny_threshold1": 50,
+  "canny_threshold2": 150,
+  "min_area": 20000
+}

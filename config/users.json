@@ -1,0 +1,10 @@
+{
+    "vitor": {
+        "password": "senhaSegura",
+        "type": "User"
+    },
+    "Vitor": {
+        "password": "1234",
+        "type": "SuperAdmin"
+    }
+}

@@ -1,0 +1,9 @@
+{
+    "line_top": 4,
+    "line_bottom": 96,
+    "line_left": 7,
+    "line_right": 90,
+    "gaussian_blur": 1,
+    "canny_threshold1": 27,
+    "canny_threshold2": 102
+}
