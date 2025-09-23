@@ -29,3 +29,4 @@ outputs/
 # Qt / PySide artefactos
 *.ui~
 *.qrc~
+replacements.txt
