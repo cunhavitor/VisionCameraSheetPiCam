@@ -1,11 +1,11 @@
 {
-    "ExposureTime": 34500,
-    "AnalogueGain": 1.7,
-    "Brightness": 0.6,
+    "ExposureTime": 66657,
+    "AnalogueGain": 10.0,
+    "Brightness": 1.0,
     "Contrast": 3.0,
     "ColourGains": [
-        2.8,
-        2.0
+        3.27,
+        1.66
     ],
     "AeEnable": false,
     "AwbEnable": false

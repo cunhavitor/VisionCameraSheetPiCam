@@ -253,6 +253,12 @@ class CameraAdjustParamsWindow(QDialog):
         if not self.live_mode:
             return
         frame = self.picam2.capture_array()
+        # Atualiza UI com valores automáticos atuais (se AE/AWB ativos)
+        try:
+            md = self.picam2.capture_metadata()
+            self._update_ui_from_metadata(md)
+        except Exception:
+            md = None
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pix = self._to_pixmap_with_overlay(frame)
         self.image_label.set_image(pix)
@@ -281,12 +287,39 @@ class CameraAdjustParamsWindow(QDialog):
                 self.safe_set_controls({"AwbEnable": False, "ColourGains": (self.red_gain_spin.value(), value)})
 
     def save_params(self):
+        # Quando AE/AWB estão ligados, queremos guardar os valores automáticos atuais.
+        md = {}
+        try:
+            md = self.picam2.capture_metadata() or {}
+        except Exception:
+            md = {}
+
+        exp_value = int(self.exposure_spin.value())
+        gain_value = float(self.gain_spin.value())
+        if self.ae_enabled:
+            exp_value = int(md.get("ExposureTime", exp_value))
+            try:
+                gain_value = float(md.get("AnalogueGain", gain_value))
+            except Exception:
+                pass
+
+        red_value = float(self.red_gain_spin.value())
+        blue_value = float(self.blue_gain_spin.value())
+        if self.awb_enabled:
+            cg = md.get("ColourGains")
+            if isinstance(cg, (list, tuple)) and len(cg) == 2:
+                try:
+                    red_value = float(cg[0])
+                    blue_value = float(cg[1])
+                except Exception:
+                    pass
+
         params = {
-            "ExposureTime": int(self.exposure_spin.value()),
-            "AnalogueGain": float(self.gain_spin.value()),
+            "ExposureTime": exp_value,
+            "AnalogueGain": gain_value,
             "Brightness": float(self.brightness_spin.value()),
             "Contrast": float(self.contrast_spin.value()),
-            "ColourGains": [float(self.red_gain_spin.value()), float(self.blue_gain_spin.value())],
+            "ColourGains": [red_value, blue_value],
             "AeEnable": bool(self.ae_enabled),
             "AwbEnable": bool(self.awb_enabled)
         }
@@ -379,6 +412,12 @@ class CameraAdjustParamsWindow(QDialog):
         self.exposure_spin.setEnabled(not self.ae_enabled)
         self.gain_spin.setEnabled(not self.ae_enabled)
         self.status_label.setText(f"[INFO] AE {'ativado' if self.ae_enabled else 'desativado'}.")
+        # Atualiza UI com valores atuais do AE para refletir o que a câmara está a usar
+        try:
+            md = self.picam2.capture_metadata()
+            self._update_ui_from_metadata(md)
+        except Exception:
+            pass
 
     def _toggle_awb(self, enabled: bool):
         self.awb_enabled = bool(enabled)
@@ -386,6 +425,12 @@ class CameraAdjustParamsWindow(QDialog):
         self.red_gain_spin.setEnabled(not self.awb_enabled)
         self.blue_gain_spin.setEnabled(not self.awb_enabled)
         self.status_label.setText(f"[INFO] AWB {'ativado' if self.awb_enabled else 'desativado'}.")
+        # Atualiza UI com valores atuais do AWB para refletir o que a câmara está a usar
+        try:
+            md = self.picam2.capture_metadata()
+            self._update_ui_from_metadata(md)
+        except Exception:
+            pass
 
     def _apply_ae_awb_state(self):
         # Aplica estado aos controlos da câmera
@@ -455,3 +500,33 @@ class CameraAdjustParamsWindow(QDialog):
         if not self._dirty:
             self._dirty = True
             self.status_label.setText("[EDIT] Alterações não guardadas (S para guardar).")
+
+    # ---------------- UI sync helpers ----------------
+    def _set_spin_quietly(self, spin: LabelNumeric, value):
+        try:
+            spin.spinbox.blockSignals(True)
+            spin.setValue(value)
+        finally:
+            spin.spinbox.blockSignals(False)
+
+    def _update_ui_from_metadata(self, md: dict):
+        if not isinstance(md, dict):
+            return
+        # Se AE ativo, refletir ExposureTime e AnalogueGain automáticos
+        if self.ae_enabled:
+            if "ExposureTime" in md:
+                self._set_spin_quietly(self.exposure_spin, int(md["ExposureTime"]))
+            if "AnalogueGain" in md:
+                try:
+                    self._set_spin_quietly(self.gain_spin, float(md["AnalogueGain"]))
+                except Exception:
+                    pass
+        # Se AWB ativo, refletir ColourGains automáticos
+        if self.awb_enabled:
+            cg = md.get("ColourGains")
+            if isinstance(cg, (list, tuple)) and len(cg) == 2:
+                try:
+                    self._set_spin_quietly(self.red_gain_spin, float(cg[0]))
+                    self._set_spin_quietly(self.blue_gain_spin, float(cg[1]))
+                except Exception:
+                    pass

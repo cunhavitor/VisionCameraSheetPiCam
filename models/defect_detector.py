@@ -5,7 +5,7 @@ import time
 # =========================
 #  MODO ESTÁTICO (troca aqui)
 # =========================
-mode = "Simple"   # <- "Simple" ou "Full"
+mode = "Full"   # <- "Simple" ou "Full"
 
 # ---------------------------
 # Hiper-parâmetros do modo Simple (podes afinar no código)

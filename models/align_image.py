@@ -11,6 +11,15 @@ def align_with_template(current_img, template_img, config_path="config/config_al
     Alinha a imagem atual com o template usando ORB + Homografia, redimensionando temporariamente para acelerar o processo.
     """
     start_time = time.perf_counter()
+    # Improve determinism: seed RNG and limit threading during alignment
+    try:
+        cv2.setRNGSeed(12345)
+    except Exception:
+        pass
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
     # Carregar parâmetros
     with open(config_path, "r") as f:
@@ -71,4 +80,3 @@ def align_with_template(current_img, template_img, config_path="config/config_al
     print(f"Align Image (com resize) demorou {end_time - start_time:.4f} segundos")
 
     return aligned, H
-

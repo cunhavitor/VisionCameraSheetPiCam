@@ -49,21 +49,32 @@ def _load_camera_params_from_json(path="config/camera_params.json"):
 def _build_controls_from_params(params: dict):
     """
     Converte o JSON em dict de controls para Picamera2.
-    Desativa AE/AWB e aplica Exposure/Gain/ColourGains/Brightness/Contrast.
+    Respeita AeEnable/AwbEnable guardados e só força manuais quando desativados.
     """
+    ae_on = bool(params.get("AeEnable", False))
+    awb_on = bool(params.get("AwbEnable", False))
+
     controls = {
-        "AeEnable": False,
-        "AwbEnable": False,
+        "AeEnable": ae_on,
+        "AwbEnable": awb_on,
     }
-    if "ExposureTime" in params:
-        controls["ExposureTime"] = int(params["ExposureTime"])  # µs
-        # Opcional: travar frame duration para estabilizar ainda mais
-        # controls["FrameDurationLimits"] = (int(params["ExposureTime"]), int(params["ExposureTime"]))
-    if "AnalogueGain" in params:
-        controls["AnalogueGain"] = float(params["AnalogueGain"])
-    if "ColourGains" in params and isinstance(params["ColourGains"], (list, tuple)) and len(params["ColourGains"]) == 2:
-        rg, bg = params["ColourGains"]
-        controls["ColourGains"] = (float(rg), float(bg))
+
+    # Apenas aplica Exposure/Gain manuais quando AE está OFF
+    if not ae_on:
+        if "ExposureTime" in params:
+            controls["ExposureTime"] = int(params["ExposureTime"])  # µs
+            # Opcional: travar frame duration para estabilizar ainda mais
+            controls["FrameDurationLimits"] = (int(params["ExposureTime"]), int(params["ExposureTime"]))
+        if "AnalogueGain" in params:
+            controls["AnalogueGain"] = float(params["AnalogueGain"])
+
+    # Apenas aplica ColourGains manuais quando AWB está OFF
+    if not awb_on:
+        if "ColourGains" in params and isinstance(params["ColourGains"], (list, tuple)) and len(params["ColourGains"]) == 2:
+            rg, bg = params["ColourGains"]
+            controls["ColourGains"] = (float(rg), float(bg))
+
+    # Estes podem ser sempre aplicados
     if "Brightness" in params:
         controls["Brightness"] = float(params["Brightness"])
     if "Contrast" in params:
@@ -112,6 +123,7 @@ class InspectionWindow(QDialog):
         self.last_aligned = None     # última imagem alinhada analisada (color)
         self.last_vis_bw  = None     # última imagem B/W com círculos
         self.last_vis_color = None   # última imagem COLOR com círculos
+        self.last_H = None  # homografia a reutilizar enquanto a folha estiver parada
 
         # Layout principal
         main_layout = QVBoxLayout(self)
@@ -587,7 +599,10 @@ class InspectionWindow(QDialog):
             mu_t, sd_t = float(np.mean(tpl_lab[:,:,c][m])), float(np.std(tpl_lab[:,:,c][m]) + eps)
             mu_i, sd_i = float(np.mean(img_lab[:,:,c][m])), float(np.std(img_lab[:,:,c][m]) + eps)
             gain = sd_t / sd_i
+            # clamp to avoid over/under-correction jitter
+            gain = max(0.8, min(1.25, gain))
             bias = mu_t - gain * mu_i
+            bias = max(-10.0, min(10.0, bias))
             norm[:,:,c] = gain * img_lab[:,:,c] + bias
         norm = np.clip(norm, 0, 255).astype(np.uint8)
         return cv2.cvtColor(norm, cv2.COLOR_LAB2BGR)
@@ -601,22 +616,36 @@ class InspectionWindow(QDialog):
         except Exception:
             pass
 
-        # 1) Captura (stream "main") e trava AE/AWB
+       # 1) Bloquear AE/AWB ANTES da captura (para estabilizar a exposição)
+        self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
+        time.sleep(0.05)
         frame = self.picam2.capture_array("main")
         self.current_full = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
 
-        # 2) Alinhamento (current -> template). Mantém também a H.
-        H = None
-        try:
-            self.aligned_full, H = align_with_template(self.current_full, self.template_full)
-            if self.aligned_full is None or H is None:
-                raise ValueError("Falhou alinhamento")
-        except Exception as e:
-            print("⚠️ Erro no alinhamento, usando imagem original:", e)
-            self.aligned_full = self.current_full.copy()
-            # Homografia identidade como fallback (desenha sem reprojetar)
-            H = np.eye(3, dtype=np.float32)
+        # 2) Alinhamento (current -> template) com reutilização da última H
+        H = getattr(self, "last_H", None)
+        if H is not None:
+            try:
+                # warpa diretamente com a H anterior (mais estável entre cliques)
+                self.aligned_full = cv2.warpPerspective(
+                    self.current_full, H,
+                    (self.template_full.shape[1], self.template_full.shape[0])
+                )
+            except Exception:
+                H = None  # força realinhar se der erro
+
+        if H is None:
+            # não havia H válida — faz o alinhamento completo e guarda H
+            try:
+                self.aligned_full, H = align_with_template(self.current_full, self.template_full)
+                if self.aligned_full is None or H is None:
+                    raise ValueError("Falhou alinhamento")
+                self.last_H = H  # <- guarda para os próximos cliques
+            except Exception as e:
+                print("⚠️ Erro no alinhamento, usando imagem original:", e)
+                self.aligned_full = self.current_full.copy()
+                H = np.eye(3, dtype=np.float32)
+                self.last_H = None  # não guardar uma H inválida
 
         # Inversa: template -> current (para reprojetar desenho)
         try:
@@ -640,13 +669,10 @@ class InspectionWindow(QDialog):
         cur_roi  = self.aligned_full[y0:y0+h0, x0:x0+w0]
         mask_roi = self.safe_mask[y0:y0+h0, x0:x0+w0]
 
-        # Normalização fotométrica condicional (como no Tuner)
+        # Normalização fotométrica sempre aplicada para estabilidade
         tpl_masked_roi = cv2.bitwise_and(tpl_roi, tpl_roi, mask=mask_roi)
         cur_masked_roi = cv2.bitwise_and(cur_roi, cur_roi, mask=mask_roi)
-        tpl_mean = cv2.mean(cv2.cvtColor(tpl_masked_roi, cv2.COLOR_BGR2GRAY), mask=mask_roi)[0]
-        ali_mean = cv2.mean(cv2.cvtColor(cur_masked_roi, cv2.COLOR_BGR2GRAY), mask=mask_roi)[0]
-        if abs(tpl_mean - ali_mean) > 1.0:
-            cur_masked_roi = self._normalize_lab_to_template(tpl_masked_roi, cur_masked_roi, mask_roi)
+        cur_masked_roi = self._normalize_lab_to_template(tpl_masked_roi, cur_masked_roi, mask_roi)
 
         # 5) Deteção de defeitos (em coords do TEMPLATE/ROI)
         t_det = time.perf_counter()
@@ -787,18 +813,24 @@ class InspectionWindow(QDialog):
                 "cx": int(cxi), "cy": int(cyi), "r": int(ri)
             })
 
-        # 7) Atualiza contadores e UI (igual ao teu)
+        # 7) Atualiza contadores e UI
         can_ids = {d["lata"] for d in defect_data if d.get("lata") is not None}
         cans_with_defects = len(can_ids)
         per_sheet_total = len(self.instancias_poligonos) if hasattr(self, 'instancias_poligonos') else 0
         per_sheet_good = max(0, per_sheet_total - cans_with_defects)
+
+        # contar folha sempre que corre _show_defects
         self.count_sheets += 1
-        self.count_total_cans += per_sheet_total
-        self.count_good_cans += per_sheet_good
-        self.count_defect_cans += cans_with_defects
+        self.systemTotalSheets.set_value(self.count_sheets)
+
+        # acumular latas/defeitos apenas com o cronómetro ativo
+        if self.elapsed_timer.isActive():
+            self.count_total_cans += per_sheet_total
+            self.count_good_cans  += per_sheet_good
+            self.count_defect_cans += cans_with_defects
+
         defect_pct = (self.count_defect_cans / self.count_total_cans * 100.0) if self.count_total_cans > 0 else 0.0
 
-        self.systemTotalSheets.set_value(self.count_sheets)
         self.systemTotalCans.set_value(self.count_total_cans)
         self.systemGoodCans.set_value(self.count_good_cans)
         self.systemTotalDefects.set_value(self.count_defect_cans)
@@ -839,6 +871,8 @@ class InspectionWindow(QDialog):
         now = time.time()
         self._elapsed_start_ts = now - int(self._elapsed_seconds)
         self.elapsed_timer.start()
+        # reset counters at the beginning of a new Start session
+        self._reset_counters()
         if hasattr(self, 'btn_start'):
             self.btn_start.setEnabled(False)
         if hasattr(self, 'btn_stop'):
