@@ -83,8 +83,13 @@ class DefectTunerWindow(QDialog):
         "w_black": 0.15,
         "w_color": 0.10,
         "fused_percentile": 99.5,
+        # Final map behavior
+        "final_mode": "extended",  # "classic" or "extended"
+        "final_include_gradient": 1,
         # Visual
-        "use_heatmap_bg": 1
+        "use_heatmap_bg": 1,
+        # Overexposure ignore (glare/white saturation)
+        "ignore_overexposed": 0
         }
 
         # ⬇️ carregar valores guardados (antes de criares os spinboxes)
@@ -129,7 +134,10 @@ class DefectTunerWindow(QDialog):
             "w_black": "Peso do mapa Black‑hat.",
             "w_color": "Peso do mapa de cor.",
             "fused_percentile": "Percentil do limiar no mapa fundido (0–100).",
-            "use_heatmap_bg": "Usa o mapa de calor do diff escuro (CLAHE) como fundo."
+            "final_mode": "Como calcular o mapa Final: clássico (união dos 4 mapas) ou estendido (com fusão).",
+            "final_include_gradient": "Se ligado, inclui o mapa de Gradiente na máscara Final (modo clássico).",
+            "use_heatmap_bg": "Usa o mapa de calor do diff escuro (CLAHE) como fundo.",
+            "ignore_overexposed": "Ignora zonas muito claras/brancas (reflexos/saturação) ao contabilizar defeitos."
         }
 
         # --- Layout principal: vertical (topo com 3 colunas + barra inferior) ---
@@ -218,6 +226,7 @@ class DefectTunerWindow(QDialog):
         add_spin("Threshold Vermelho", "red_threshold", 0, 255, f_basic)
         add_spin("Gradiente Escuro (CLAHE)", "dark_gradient_threshold", 0, 255, f_basic)
         add_spin("Área mínima do defeito", "min_defect_area", 1, 100000, f_basic)
+        add_check("Ignorar zonas superexpostas", "ignore_overexposed", f_basic)
         basics_idx = tabs.addTab(basics_page, "🧩 Basics")
         tabs.setTabToolTip(basics_idx, "Parâmetros gerais para calibrar sensibilidade e tamanho mínimo de defeitos.")
         self._basics_v = basics_v
@@ -305,6 +314,15 @@ class DefectTunerWindow(QDialog):
         add_dspin("Peso black-hat", "w_black", 0.0, 1.0, f_fusion, step=0.05, dec=2)
         add_dspin("Peso cor", "w_color", 0.0, 1.0, f_fusion, step=0.05, dec=2)
         add_dspin("Percentil fusão", "fused_percentile", 90.0, 99.9, f_fusion, step=0.1, dec=1)
+        # Final map mode selector
+        lbl_finalmode = QLabel("Mapa Final")
+        self.final_mode_cb = QComboBox(); self.final_mode_cb.addItems(["classic", "extended"])
+        self.final_mode_cb.setCurrentText(str(self.params.get("final_mode", "extended")))
+        self.final_mode_cb.currentTextChanged.connect(lambda val: self._on_text_param_change("final_mode", val))
+        self.final_mode_cb.setToolTip(self._tooltips.get("final_mode", ""))
+        f_fusion.addRow(lbl_finalmode, self.final_mode_cb)
+        # Include Gradient in Final (classic)
+        add_check("Incluir Gradiente no Final", "final_include_gradient", f_fusion)
         fusion_idx = tabs.addTab(fusion_page, "🔗 Fusion")
         tabs.setTabToolTip(fusion_idx, "Combinação das pistas (estrutura, morfologia, cor) em mapa final.")
         # Always-visible defect count (outside tabs)
@@ -401,6 +419,25 @@ class DefectTunerWindow(QDialog):
         self._update_preview()
 
     # ---------- UI helpers ----------
+    def _sync_params_from_ui(self):
+        """Read current widget states into self.params before saving."""
+        try:
+            for key, w in self.spin_boxes.items():
+                if hasattr(w, "isChecked"):
+                    self.params[key] = 1 if bool(w.isChecked()) else 0
+                elif hasattr(w, "value"):
+                    val = w.value()
+                    if isinstance(val, float):
+                        self.params[key] = float(val)
+                    else:
+                        self.params[key] = int(val)
+            if hasattr(self, "color_metric_cb"):
+                self.params["color_metric"] = str(self.color_metric_cb.currentText())
+            if hasattr(self, "fusion_mode_cb"):
+                self.params["fusion_mode"] = str(self.fusion_mode_cb.currentText())
+        except Exception as e:
+            print("[Tuner] _sync_params_from_ui warning:", e)
+
     def _create_spinbox(self, label_text, param_name, min_val, max_val, target_layout):
         label = QLabel(label_text)
         target_layout.addWidget(label)
@@ -477,8 +514,8 @@ class DefectTunerWindow(QDialog):
                 "color_percentile", "w_struct", "w_top", "w_black", "w_color",
                 "fused_percentile"
             }
-            bool_keys = {"use_ms_ssim", "use_morph_maps", "use_color_delta", "use_heatmap_bg"}
-            string_keys = {"color_metric", "fusion_mode"}
+            bool_keys = {"use_ms_ssim", "use_morph_maps", "use_color_delta", "use_heatmap_bg", "ignore_overexposed"}
+            string_keys = {"color_metric", "fusion_mode", "final_mode"}
 
             for k in list(merged.keys()):
                 if k not in data:
@@ -486,7 +523,16 @@ class DefectTunerWindow(QDialog):
                 v = data[k]
                 try:
                     if k in bool_keys:
-                        v = 1 if bool(v) else 0
+                        # robust boolean parsing: accepts 1/0, True/False, "true"/"false", "yes"/"no"
+                        if isinstance(v, (int, np.integer)):
+                            v = 1 if int(v) != 0 else 0
+                        elif isinstance(v, bool):
+                            v = 1 if v else 0
+                        elif isinstance(v, str):
+                            v_norm = v.strip().lower()
+                            v = 1 if v_norm in {"1", "true", "yes", "on"} else 0
+                        else:
+                            v = 1 if bool(v) else 0
                     elif k in float_keys:
                         v = float(v)
                     elif k in string_keys:
@@ -678,7 +724,100 @@ class DefectTunerWindow(QDialog):
         cv2.circle(debug_vis, maxLoc, 40, (0,255,255), 2, cv2.LINE_AA)
         # depois mostrares o debug_vis no lugar do preview para ver se faz sentido
 
+        # --- Short-circuit: Escuro mode fast path (skip heavy extras) ---
+        mode_fast = self.view_mode.currentText()
+        if mode_fast == "Escuro":
+            use_heatmap_bg = bool(int(self.params.get("use_heatmap_bg", 0)))
+            # Downscale for speed (process at <= 1200px on the long side)
+            H0, W0 = t_gray_raw.shape
+            target_max = 1200
+            scale = min(1.0, float(target_max) / float(max(H0, W0)))
+            inv_scale = 1.0 / scale
+
+            if scale < 1.0:
+                t_small = cv2.resize(t_gray_raw, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                a_small = cv2.resize(a_gray_raw, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                m_small = cv2.resize(mask_bin, (t_small.shape[1], t_small.shape[0]), interpolation=cv2.INTER_NEAREST)
+            else:
+                t_small, a_small, m_small = t_gray_raw, a_gray_raw, mask_bin
+
+            # Build dark score on blurred grayscale + micro blackhat, gated by gradient (small)
+            t_blur_hm = cv2.GaussianBlur(t_small, (5, 5), 0)
+            a_blur_hm = cv2.GaussianBlur(a_small, (5, 5), 0)
+            hm_dark_s = cv2.subtract(t_blur_hm, a_blur_hm)
+            # gradient gate (small)
+            a_blur_grad = cv2.GaussianBlur(a_small, (5, 5), 0)
+            hm_grad_s = cv2.morphologyEx(a_blur_grad, cv2.MORPH_GRADIENT, np.ones((5, 5), np.uint8))
+            if dark_grad <= 0:
+                gradient_mask_dark_s = m_small.copy()
+            else:
+                _, gradient_mask_dark_s = cv2.threshold(hm_grad_s, int(dark_grad), 255, cv2.THRESH_BINARY)
+            gradient_mask_dark_s = cv2.bitwise_and(gradient_mask_dark_s, m_small)
+            # threshold main dark (small)
+            _, dark_thr_s = cv2.threshold(hm_dark_s, int(dark_th), 255, cv2.THRESH_BINARY)
+            dark_thr_s = cv2.bitwise_and(dark_thr_s, gradient_mask_dark_s)
+            # micro dark via blackhat (small)
+            bh_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+            bh_tpl = cv2.morphologyEx(t_blur_hm, cv2.MORPH_BLACKHAT, bh_kernel)
+            bh_cur = cv2.morphologyEx(a_blur_hm, cv2.MORPH_BLACKHAT, bh_kernel)
+            hm_bh_s = cv2.subtract(bh_cur, bh_tpl)
+            bh_th = max(6, min(20, int(max(dark_th, 0)) // 2 + 6))
+            _, micro_dark_s = cv2.threshold(hm_bh_s, bh_th, 255, cv2.THRESH_BINARY)
+            micro_dark_s = cv2.bitwise_and(micro_dark_s, m_small)
+            dark_mask_s = cv2.bitwise_or(dark_thr_s, micro_dark_s)
+            # morphology cleanup (small)
+            escuro_clean_s = self._morph(dark_mask_s, dark_k, dark_it)
+
+            # Base image at original scale
+            if use_heatmap_bg:
+                # Apply gradient gate only to grayscale diff; micro-blackhat remains un-gated (like detector)
+                diff_gated_s = cv2.bitwise_and(hm_dark_s, gradient_mask_dark_s)
+                bh_roi_s = cv2.bitwise_and(hm_bh_s, m_small)
+                score_dark_s = cv2.max(diff_gated_s, bh_roi_s)
+                score_dark_s = cv2.bitwise_and(score_dark_s, escuro_clean_s)
+                score_dark = cv2.resize(score_dark_s, (W0, H0), interpolation=cv2.INTER_LINEAR)
+                hm = cv2.normalize(score_dark, None, 0, 255, cv2.NORM_MINMAX)
+                hm = cv2.applyColorMap(hm, cv2.COLORMAP_JET)
+                preview = cv2.bitwise_and(hm, hm, mask=mask_bin)
+            else:
+                if self.display_mode.currentText() == "PB":
+                    preview = cv2.cvtColor(ali_m, cv2.COLOR_BGR2GRAY)
+                    preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+                else:
+                    preview = ali_m.copy()
+
+            # Draw larger white circles per contour, scaled to original size
+            num_defeitos = 0
+            cnts_s, _ = cv2.findContours(escuro_clean_s, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in cnts_s:
+                area_s = cv2.contourArea(cnt)
+                area = area_s * (inv_scale * inv_scale)
+                if area < min_area:
+                    continue
+                (cx_s, cy_s), r_s = cv2.minEnclosingCircle(cnt)
+                cx = int(round(cx_s * inv_scale))
+                cy = int(round(cy_s * inv_scale))
+                r  = float(r_s) * inv_scale
+                rad_draw = max(22, int(round(r * 1.4)) + 10)
+                cv2.circle(preview, (cx, cy), rad_draw, (255, 255, 255), 3, cv2.LINE_AA)
+                num_defeitos += 1
+            # Update UI and return
+            self.defect_count_label.setText(f"Total de defeitos: {num_defeitos}")
+            preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+            h, w, ch = preview_rgb.shape
+            qt_image = QImage(preview_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image).scaled(
+                INSPECTION_PREVIEW_WIDTH, INSPECTION_PREVIEW_HEIGHT,
+                Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.image_label.setPixmap(pixmap)
+            self.last_preview = preview.copy()
+            return
+
         # --- detecção real (usa os MESMOS tensores que visualizas) ---
+        # Final mode toggle: classic = union of 4 maps (no fusion extras); extended = with fusion extras
+        _final_mode = str(self.params.get("final_mode", "extended")).strip().lower()
+        _classic = (_final_mode == "classic")
         final_mask, _, dark_mask_filt, bright_mask_raw, blue_mask_raw, red_mask_raw, msssim_mask, fused_mask = detect_defects(
             tpl_m, ali_m, mask_bin,
             dark_th, bright_th,
@@ -687,9 +826,9 @@ class DefectTunerWindow(QDialog):
             min_area, dark_grad,
             blue_th, red_th,
             # ---- MS-SSIM ----
-            use_ms_ssim=bool(int(self.params["use_ms_ssim"])),
+            use_ms_ssim=(False if _classic else bool(int(self.params["use_ms_ssim"]))),
             msssim_percentile=float(self.params["msssim_percentile"]),
-            msssim_weight=float(self.params["msssim_weight"]),
+            msssim_weight=(0.0 if _classic else float(self.params["msssim_weight"])) ,
             msssim_kernel_sizes=(
                 int(self.params["msssim_kernel_size_s1"]),
                 int(self.params["msssim_kernel_size_s2"]),
@@ -702,13 +841,15 @@ class DefectTunerWindow(QDialog):
             ),
             msssim_morph_kernel_size=int(self.params["msssim_morph_kernel_size"]),
             msssim_morph_iterations=int(self.params["msssim_morph_iterations"]),
+            # ---- Overexposure ----
+            ignore_overexposed=bool(int(self.params.get("ignore_overexposed", 0))),
             # ---- Mapas adicionais + Fusão ----
-            use_morph_maps=bool(int(self.params["use_morph_maps"])),
+            use_morph_maps=(False if _classic else bool(int(self.params["use_morph_maps"]))),
             th_top_percentile=float(self.params["th_top_percentile"]),
             th_black_percentile=float(self.params["th_black_percentile"]),
             se_top=int(self.params["se_top"]),
             se_black=int(self.params["se_black"]),
-            use_color_delta=bool(int(self.params["use_color_delta"])),
+            use_color_delta=(False if _classic else bool(int(self.params["use_color_delta"]))),
             color_metric=str(self.params["color_metric"]),
             color_percentile=float(self.params["color_percentile"]),
             fusion_mode=str(self.params["fusion_mode"]),
@@ -774,6 +915,26 @@ class DefectTunerWindow(QDialog):
         a_blur_grad = cv2.GaussianBlur(a_gray_raw, (5, 5), 0)
         hm_grad = cv2.morphologyEx(a_blur_grad, cv2.MORPH_GRADIENT, np.ones((5, 5), np.uint8))
 
+        # Enforce classic final mode as union of Escuro, Gradiente, Amarelo, Azul, Vermelho
+        if _classic:
+            if dark_grad <= 0:
+                gradient_mask_dark = mask_bin.copy()
+            else:
+                _, gradient_mask_dark = cv2.threshold(hm_grad, int(dark_grad), 255, cv2.THRESH_BINARY)
+            gradient_mask_dark = cv2.bitwise_and(gradient_mask_dark, mask_bin)
+
+            escuro_clean_final   = self._morph(dark_mask_filt, dark_k, dark_it)
+            amarelo_clean_final  = self._morph(bright_mask_raw, color_k, color_it)
+            azul_clean_final     = self._morph(blue_mask_raw,   color_k, color_it)
+            vermelho_clean_final = self._morph(red_mask_raw,    color_k, color_it)
+
+            final_union = cv2.bitwise_or(escuro_clean_final, amarelo_clean_final)
+            final_union = cv2.bitwise_or(final_union,        azul_clean_final)
+            final_union = cv2.bitwise_or(final_union,        vermelho_clean_final)
+            if bool(int(self.params.get("final_include_gradient", 1))):
+                final_union = cv2.bitwise_or(final_union, gradient_mask_dark)
+            final_mask = final_union
+
         if mode == "DEBUG: Diff escuro (CLAHE)":
             # Mapa de calor do diff escuro (com CLAHE) como fundo, se ativado
             if use_heatmap_bg:
@@ -793,9 +954,40 @@ class DefectTunerWindow(QDialog):
             draw_mask(final_mask, (0, 255, 0))
 
         elif mode == "Escuro":
+            # Build detector-like dark score (grayscale diff + blackhat), gate by gradient
+            # Then mask by the actually detected dark mask (post-morph) for strict alignment
+            escuro_clean = self._morph(dark_mask_filt, dark_k, dark_it)
             if use_heatmap_bg:
-                preview = make_heatmap(hm_dark)
-            draw_mask(dark_mask_filt, (255, 0, 0))
+                bh_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+                bh_tpl = cv2.morphologyEx(t_blur_hm, cv2.MORPH_BLACKHAT, bh_kernel)
+                bh_cur = cv2.morphologyEx(a_blur_hm, cv2.MORPH_BLACKHAT, bh_kernel)
+                hm_bh = cv2.subtract(bh_cur, bh_tpl)
+
+                morph_grad = hm_grad  # gradiente de a_blur_hm
+                if dark_grad <= 0:
+                    gradient_mask_dark = mask_bin.copy()
+                else:
+                    _, gradient_mask_dark = cv2.threshold(morph_grad, int(dark_grad), 255, cv2.THRESH_BINARY)
+                gradient_mask_dark = cv2.bitwise_and(gradient_mask_dark, mask_bin)
+
+                # Gate only the gray diff; do not gate micro-blackhat
+                diff_gated = cv2.bitwise_and(hm_dark, gradient_mask_dark)
+                bh_roi = cv2.bitwise_and(hm_bh, mask_bin)
+                score_dark = cv2.max(diff_gated, bh_roi)
+                score_dark = cv2.bitwise_and(score_dark, escuro_clean)
+                preview = make_heatmap(score_dark)
+
+            # Draw exact outlines in black but clip strictly to the detected mask
+            cnts, _ = cv2.findContours(escuro_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in cnts:
+                if cv2.contourArea(cnt) < min_area:
+                    continue
+                stroke = np.zeros(escuro_clean.shape, dtype=np.uint8)
+                cv2.drawContours(stroke, [cnt], -1, 255, 3, cv2.LINE_AA)
+                stroke = cv2.bitwise_and(stroke, escuro_clean)
+                preview[stroke > 0] = (0, 0, 0)
+                num_defeitos += 1
+
         elif mode == "Amarelo":
             if use_heatmap_bg:
                 preview = make_heatmap(hm_yel)
@@ -872,7 +1064,17 @@ class DefectTunerWindow(QDialog):
             cv2.imwrite(path, self.last_preview)
             print(f"Imagem exportada para {path}")
 
+    def closeEvent(self, event):
+        try:
+            # auto-save params on close so user toggles persist without Ctrl+S
+            self._save_current_params()
+        except Exception as e:
+            print("[Tuner] Auto-save on close failed:", e)
+        event.accept()
+
     def _save_current_params(self):
+        # Ensure we capture the latest UI state
+        self._sync_params_from_ui()
         os.makedirs("config", exist_ok=True)
         os.makedirs("logs", exist_ok=True)
 
@@ -885,8 +1087,9 @@ class DefectTunerWindow(QDialog):
             "color_percentile", "w_struct", "w_top", "w_black", "w_color",
             "fused_percentile"
         }
-        bool_keys = {"use_ms_ssim", "use_morph_maps", "use_color_delta", "use_heatmap_bg"}
-        string_keys = {"color_metric", "fusion_mode"}
+        bool_keys = {"use_ms_ssim", "use_morph_maps", "use_color_delta", "use_heatmap_bg", "ignore_overexposed", "final_include_gradient"}
+        
+        string_keys = {"color_metric", "fusion_mode", "final_mode"}
         for k, v in self.params.items():
             if k in bool_keys:
                 params_to_save[k] = 1 if bool(int(v)) else 0
@@ -913,7 +1116,7 @@ class DefectTunerWindow(QDialog):
             "dark_threshold","bright_threshold","blue_threshold","red_threshold",
             "dark_morph_kernel_size","dark_morph_iterations",
             "bright_morph_kernel_size","bright_morph_iterations",
-            "dark_gradient_threshold","min_defect_area","detect_area",
+            "dark_gradient_threshold","min_defect_area","detect_area","ignore_overexposed","use_heatmap_bg",
             # novos MS-SSIM
             "use_ms_ssim","msssim_percentile","msssim_weight",
             "msssim_kernel_size_s1","msssim_kernel_size_s2","msssim_kernel_size_s3",
