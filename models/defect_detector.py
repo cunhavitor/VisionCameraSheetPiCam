@@ -2,6 +2,24 @@ import cv2
 import numpy as np
 import time
 
+# =========================
+#  MODO ESTÁTICO (troca aqui)
+# =========================
+mode = "Simple"   # <- "Simple" ou "Full"
+
+# ---------------------------
+# Hiper-parâmetros do modo Simple (podes afinar no código)
+# ---------------------------
+SIMPLE_ALPHA = 0.5           # peso DSSIM
+SIMPLE_BETA  = 0.3           # peso cor (Δa/Δb)
+SIMPLE_GAMMA = 0.2           # peso residual passa-banda
+SIMPLE_PERCENTILE = 99.5     # percentil do score para binarizar (no ROI)
+SIMPLE_BAND_KSIZE = 5        # janela da Gaussiana (ímpar)
+SIMPLE_BAND_SIGMA1 = 1.0     # sigma1 para DoG
+SIMPLE_BAND_SIGMA2 = 2.0     # sigma2 para DoG
+SIMPLE_MORPH_KERNEL = 3      # morfologia final do Simple
+SIMPLE_MORPH_ITERS  = 1
+
 def _percentile_bin(img_float01, roi_mask_u8, pct):
     """Binariza img [0..1] por percentil dentro do ROI (0..100)."""
     roi = roi_mask_u8.astype(bool)
@@ -15,7 +33,7 @@ def _percentile_bin(img_float01, roi_mask_u8, pct):
 def _norm01(x):
     x = x.astype(np.float32)
     mn, mx = x.min(), x.max()
-    if mx <= mn: 
+    if mx <= mn:
         return np.zeros_like(x, dtype=np.float32)
     return (x - mn) / (mx - mn)
 
@@ -113,10 +131,8 @@ def _apply_morphological_ops(mask, kernel_size, iterations):
     m = cv2.morphologyEx(m,    cv2.MORPH_CLOSE, kernel, iterations=it)
     return m
 
-
-
 # ---------------------------
-# Detect Defects + MS-SSIM
+# Detect Defects (+ Simple mode)
 # ---------------------------
 
 def detect_defects(tpl, aligned, mask,
@@ -134,6 +150,8 @@ def detect_defects(tpl, aligned, mask,
                    msssim_sigmas=(1.5,1.0,0.8),
                    msssim_morph_kernel_size=3,
                    msssim_morph_iterations=1,
+                   # ---- Overexposure handling ----
+                   ignore_overexposed=False,
                    # ---- NOVO: Morfologia L (top/black) ----
                    use_morph_maps=True,
                    th_top_percentile=99.5,
@@ -157,9 +175,10 @@ def detect_defects(tpl, aligned, mask,
 
     """
     Detecta defeitos comparando template vs imagem alinhada.
-    Retorna:
+    Retorna (compatível):
         final_defect_mask, filtered_contours,
-        darker_mask_filtered, brighter_mask, blue_mask, red_mask, (opcional) msssim_mask
+        darker_mask_filtered, brighter_mask, blue_mask, red_mask,
+        [opcional msssim_mask], [opcional fused_mask]
     """
     start_time = time.perf_counter()
 
@@ -175,6 +194,91 @@ def detect_defects(tpl, aligned, mask,
     a_gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
     t_blur = cv2.GaussianBlur(t_gray, (5, 5), 0)
     a_blur = cv2.GaussianBlur(a_gray, (5, 5), 0)
+
+    # --- LAB (para cor) ---
+    tpl_lab     = cv2.cvtColor(tpl,     cv2.COLOR_BGR2LAB)
+    aligned_lab = cv2.cvtColor(aligned, cv2.COLOR_BGR2LAB)
+
+    # =========================
+    #        SIMPLE MODE
+    # =========================
+    if str(mode).lower() == "simple":
+        # 1) DSSIM(L)
+        dssim = _ms_ssim_map(
+            t_blur, a_blur,
+            scales=(1.0, 0.5, 0.25),
+            ksizes=msssim_kernel_sizes,
+            sigmas=msssim_sigmas,
+            weights=(0.5, 0.3, 0.2)
+        )  # [0..1]
+
+        # 2) Residual passa-banda (DoG no |tpl - img|)
+        resid = cv2.absdiff(t_blur, a_blur).astype(np.float32)
+        resid01 = _norm01(resid)
+        k = int(SIMPLE_BAND_KSIZE)
+        if k < 3: k = 3
+        if k % 2 == 0: k += 1
+        r1 = cv2.GaussianBlur(resid01, (k, k), SIMPLE_BAND_SIGMA1)
+        r2 = cv2.GaussianBlur(resid01, (k, k), SIMPLE_BAND_SIGMA2)
+        rband = cv2.absdiff(r1, r2)
+        rband = _norm01(rband)
+
+        # 3) Cor (Δa/Δb) normalizada
+        da = cv2.absdiff(aligned_lab[:,:,1], tpl_lab[:,:,1]).astype(np.float32)
+        db = cv2.absdiff(aligned_lab[:,:,2], tpl_lab[:,:,2]).astype(np.float32)
+        color = np.maximum(da, db)  # mais simples e rápido
+        color = _norm01(color)
+
+        # 4) Score único
+        score = SIMPLE_ALPHA * dssim + SIMPLE_BETA * color + SIMPLE_GAMMA * rband
+        score = _norm01(score)
+
+        # 5) Binarização por percentil + morfologia leve
+        mask_bin_simple = _percentile_bin(score, safe_roi, SIMPLE_PERCENTILE)
+        mask_bin_simple = _apply_morphological_ops(mask_bin_simple, SIMPLE_MORPH_KERNEL, SIMPLE_MORPH_ITERS)
+
+        final_defect_mask = cv2.bitwise_and(mask_bin_simple, mask_bin_simple, mask=safe_roi)
+
+        # --- Contornos + filtros geométricos ---
+        contours, _ = cv2.findContours(final_defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filtered_contours = []
+        min_area = max(1, int(min_defect_area))
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+            peri = max(cv2.arcLength(cnt, True), 1e-6)
+            circularity = 4.0 * np.pi * area / (peri * peri)
+            if circularity < 0.02 and area > 150:
+                continue
+            filtered_contours.append(cnt)
+
+        print(f"[Simple] detect_defects took {time.perf_counter() - start_time:.4f} seconds")
+
+        # preencher retornos “antigos” como zeros (compat)
+        zeros = np.zeros_like(safe_roi, dtype=np.uint8)
+        ret = [final_defect_mask, filtered_contours, zeros, zeros, zeros, zeros]
+        # (opcional) devolver score binário/contínuo para debug: usa return_fusion/return_msssim se quiseres
+        if return_msssim:
+            # threshold por percentil no dssim para manter semântico
+            msssim_mask = _percentile_bin(dssim, safe_roi, max(98.5, min(99.9, SIMPLE_PERCENTILE)))
+            ret.append(msssim_mask)
+        if return_fusion:
+            ret.append(mask_bin_simple)
+        return tuple(ret)
+
+    # =========================
+    #          FULL MODE
+    # =========================
+
+    # --- Overexposed mask (optional) ---
+    over_mask = None
+    if ignore_overexposed:
+        hsv = cv2.cvtColor(aligned, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2]
+        _, over_mask = cv2.threshold(v, 250, 255, cv2.THRESH_BINARY)
+        over_mask = cv2.bitwise_and(over_mask, safe_roi)
+        over_mask = cv2.dilate(over_mask, np.ones((3, 3), np.uint8), iterations=1)
 
     # --- Edges finas (para cores) ---
     edges_tpl = cv2.Canny(t_blur,  60, 180)
@@ -207,9 +311,6 @@ def detect_defects(tpl, aligned, mask,
     darker_mask_filtered = cv2.bitwise_or(darker_mask_filtered, micro_dark)
 
     # --- LAB para cores (com supressão leve de arestas finas) ---
-    tpl_lab     = cv2.cvtColor(tpl,     cv2.COLOR_BGR2LAB)
-    aligned_lab = cv2.cvtColor(aligned, cv2.COLOR_BGR2LAB)
-
     diff_bright_yellow_raw = cv2.subtract(aligned_lab[:, :, 2], tpl_lab[:, :, 2])  # +amarelo
     _, brighter_mask = cv2.threshold(diff_bright_yellow_raw, int(bright_threshold), 255, cv2.THRESH_BINARY)
     brighter_mask = cv2.bitwise_and(brighter_mask, edge_mask_inv_thin)
@@ -225,7 +326,6 @@ def detect_defects(tpl, aligned, mask,
     # --- MS-SSIM (opcional) no canal L ---
     msssim_mask = None
     if use_ms_ssim:
-        # usa gris levemente suavizado (já tens t_blur/a_blur)
         dssim = _ms_ssim_map(
             t_blur, a_blur,
             scales=(1.0, 0.5, 0.25),
@@ -234,19 +334,11 @@ def detect_defects(tpl, aligned, mask,
             weights=(0.5, 0.3, 0.2)
         )  # float32 [0..1]
 
-        # threshold por percentil dentro do ROI seguro
         roi_vals = dssim[safe_roi.astype(bool)]
-        if roi_vals.size > 0:
-            thr = np.percentile(roi_vals, float(msssim_percentile))
-        else:
-            thr = 1.0  # evita tudo ligado
+        thr = np.percentile(roi_vals, float(msssim_percentile)) if roi_vals.size > 0 else 1.0
         msssim_mask = (dssim >= thr).astype(np.uint8) * 255
         msssim_mask = cv2.bitwise_and(msssim_mask, safe_roi)
-
-        # morfologia leve para limpar pontinhos
-        msssim_mask = _apply_morphological_ops(
-            msssim_mask, msssim_morph_kernel_size, msssim_morph_iterations
-        )
+        msssim_mask = _apply_morphological_ops(msssim_mask, msssim_morph_kernel_size, msssim_morph_iterations)
 
     # --- Morfologia (permitindo k<=1 ou it=0 = sem morfologia) ---
     darker_clean   = _apply_morphological_ops(darker_mask_filtered, dark_morph_kernel_size,   dark_morph_iterations)
@@ -260,8 +352,6 @@ def detect_defects(tpl, aligned, mask,
     combined = cv2.bitwise_or(combined,     red_clean)
 
     if use_ms_ssim and msssim_mask is not None and msssim_weight > 0:
-        # combinação por OR (rápido e conservador)
-        # alternativa (mais exigente): interseção com outros mapas quando precisares reduzir falsos
         combined = cv2.bitwise_or(combined, msssim_mask)
 
     # ---- NOVO: Top-hat / Black-hat em L ----
@@ -328,6 +418,8 @@ def detect_defects(tpl, aligned, mask,
 
     combined_fused = cv2.bitwise_or(combined, fused_mask)
     final_defect_mask = cv2.bitwise_and(combined_fused, combined_fused, mask=safe_roi)
+    if ignore_overexposed and over_mask is not None:
+        final_defect_mask = cv2.bitwise_and(final_defect_mask, cv2.bitwise_not(over_mask))
 
     # --- Contornos + filtros geométricos ---
     contours, _ = cv2.findContours(final_defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -339,13 +431,11 @@ def detect_defects(tpl, aligned, mask,
             continue
         peri = max(cv2.arcLength(cnt, True), 1e-6)
         circularity = 4.0 * np.pi * area / (peri * peri)
-        # descarta linhas muito finas e longas (mantém micro-blobs)
         if circularity < 0.02 and area > 150:
             continue
         filtered_contours.append(cnt)
 
-    print(f"detect_defects took {time.perf_counter() - start_time:.4f} seconds")
-    # inclui msssim_mask e/ou fused_mask no retorno para debug
+    print(f"[Full] detect_defects took {time.perf_counter() - start_time:.4f} seconds")
     ret = [final_defect_mask, filtered_contours,
            darker_mask_filtered, brighter_mask, blue_mask, red_mask]
     if return_msssim:

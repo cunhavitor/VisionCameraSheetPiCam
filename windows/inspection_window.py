@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QSizePolicy, QSpacerItem
 )
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QShortcut, QKeySequence
 from picamera2 import Picamera2
 
 from windows.defect_tuner_window import DefectTunerWindow
@@ -76,10 +76,17 @@ def _build_controls_from_params(params: dict):
 class InspectionWindow(QDialog):
     def __init__(self, parent=None, picam2=None, template_path="", mask_path="", user_type="User", user=""):
         super().__init__(parent)
-        self.setWindowTitle("Janela de Inspeção")
+        self.setWindowTitle("Inspeção - VisionCameraSheet")
         self.showMaximized()
-        # Dark theme background + default text color
-        self.setStyleSheet("background-color: #121212; color: #f0f0f0;")
+        # Global, consistent dark theme
+        self.setStyleSheet(
+            """
+            QDialog { background-color: #121212; color: #f0f0f0; }
+            QLabel { color: #e6e6e6; }
+            QFrame { background: transparent; }
+            QToolTip { color: #f0f0f0; background-color: #2a2a2a; border: 1px solid #444; }
+            """
+        )
 
         self.picam2 = picam2
         self.template_path = template_path
@@ -114,7 +121,7 @@ class InspectionWindow(QDialog):
         main_layout2.setSpacing(16)
         main_layout.addLayout(main_layout2)
 
-        # Bottom bar (fixed height 100)
+        # Bottom bar (status + GPIO)
         self.bottom_container = QWidget()
         self.bottom_container.setFixedHeight(100)
         self.bottom_container.setStyleSheet("background:#151515; border-top:1px solid #333333;")
@@ -130,10 +137,17 @@ class InspectionWindow(QDialog):
         # Ensure the main content area expands and bottom stays fixed
         main_layout.setStretch(0, 1)
 
-        # GPIO indicators row (22, 23, 24, 25)
+        # Status label (left side)
+        self.status_label = QLabel("Pronto.")
+        self.status_label.setStyleSheet("color:#cfcfcf; font-size:13px;")
+        self.bottom_layout.addWidget(self.status_label)
+
+        # GPIO indicators row (22, 23, 24, 25) on the right
         self.gpio_pins = [22, 23, 24, 25]
         self.gpio = RaspberryGPIO(self.gpio_pins, mode='BCM', pull='UP')
         self.gpio_indicators = {}
+
+        self.bottom_layout.addStretch(1)
 
         # Title on footer
         footer_title = QLabel("GPIO Inputs")
@@ -193,8 +207,13 @@ class InspectionWindow(QDialog):
         systemState = LabeledIndicator("Estado: ", True)
         self.left_panel.addWidget(systemState)
 
-        systemInitTime = LabeledText("Início: ", "19/09/2025 - 10:30")
+        # Dynamic start time
+        systemInitTime = LabeledText("Início: ", time.strftime("%d/%m/%Y - %H:%M:%S"))
         self.left_panel.addWidget(systemInitTime)
+
+        # Elapsed time (controlled by Start/Stop buttons)
+        self.systemElapsedTime = LabeledText("Tempo: ", "00:00:00")
+        self.left_panel.addWidget(self.systemElapsedTime)
 
         # Cumulative production counters
         self.systemTotalSheets = LabeledValue("Total Sheets: ", 0)
@@ -219,17 +238,37 @@ class InspectionWindow(QDialog):
         line.setFrameShape(QFrame.HLine)
         self.left_panel.addWidget(line)
 
+        # Start/Stop buttons (control elapsed time only)
         layoutStartStopButtons = QHBoxLayout()
         layoutStartStopButtons.setSpacing(8)
         self.btn_start = ButtonMain("▶️ Start", font_size=16)
+        self.btn_start.setToolTip("Inicia contagem de tempo")
+        self.btn_start.clicked.connect(self._start_timer)
         layoutStartStopButtons.addWidget(self.btn_start)
         self.btn_stop = ButtonMain("⏹ Stop", font_size=16)
+        self.btn_stop.setToolTip("Para contagem de tempo")
+        self.btn_stop.clicked.connect(self._stop_timer)
+        self.btn_stop.setEnabled(False)
         layoutStartStopButtons.addWidget(self.btn_stop)
         self.left_panel.addLayout(layoutStartStopButtons)
 
         self.btn_defects = ButtonMain("🧪 Mostrar Defeitos", font_size=16)
+        self.btn_defects.setToolTip("Executa uma inspeção única na imagem atual")
         self.btn_defects.clicked.connect(self._show_defects)
         self.left_panel.addWidget(self.btn_defects)
+
+        # Reset counters and snapshot
+        extra_buttons = QHBoxLayout()
+        extra_buttons.setSpacing(8)
+        self.btn_reset = ButtonMain("↺ Reset Contadores", font_size=14)
+        self.btn_reset.setToolTip("Zera os contadores de produção")
+        self.btn_reset.clicked.connect(self._reset_counters)
+        extra_buttons.addWidget(self.btn_reset)
+        self.btn_snapshot = ButtonMain("💾 Guardar Snapshot", font_size=14)
+        self.btn_snapshot.setToolTip("Guarda imagem atual com sobreposição de defeitos")
+        self.btn_snapshot.clicked.connect(self._save_snapshot)
+        extra_buttons.addWidget(self.btn_snapshot)
+        self.left_panel.addLayout(extra_buttons)
 
         # Painel direito (imagem) em card
         right_card = QFrame()
@@ -242,20 +281,24 @@ class InspectionWindow(QDialog):
         switches_layout = QHBoxLayout()
         switches_layout.setSpacing(12)
         self.toggle_template = Switch("🖼 Mostrar Template")
+        self.toggle_template.setToolTip("Alterna entre template e imagem de inspeção (T)")
         self.toggle_template.stateChanged.connect(self._toggle_image)
         switches_layout.addWidget(self.toggle_template)
 
         self.toggle_bw = Switch("⬛ Preto e Branco")
-        self.toggle_bw.setChecked(True)  # começa em B/W se quiseres
+        self.toggle_bw.setToolTip("Mostra imagem em escala de cinza (B)")
+        self.toggle_bw.setChecked(True)  # inicia em PB
         self.toggle_bw.stateChanged.connect(self._toggle_bw)
         switches_layout.addWidget(self.toggle_bw)
 
         self.toggle_contours = Switch("🔍 Contornos dos Defeitos")
+        self.toggle_contours.setToolTip("Mostra sobreposição de contornos detectados (C)")
         self.toggle_contours.setChecked(True)
         self.toggle_contours.stateChanged.connect(self._toggle_defect_contours)
         switches_layout.addWidget(self.toggle_contours)
 
         self.btn_tuner_window = ButtonMain("🎛️ Tuner Window", font_size=16)
+        self.btn_tuner_window.setToolTip("Abrir afinador de parâmetros (Ctrl+T)")
         self.btn_tuner_window.clicked.connect(self.open_tuner_window)
         switches_layout.addWidget(self.btn_tuner_window)
 
@@ -266,7 +309,8 @@ class InspectionWindow(QDialog):
         self.right_panel.addWidget(line)
 
         self.frame_img = ImageLabel()
-        self.frame_img.setFixedSize(INSPECTION_PREVIEW_WIDTH, INSPECTION_PREVIEW_HEIGHT)
+        # responsive image area
+        self.frame_img.setMinimumSize(INSPECTION_PREVIEW_WIDTH, INSPECTION_PREVIEW_HEIGHT)
         self.right_panel.addWidget(self.frame_img, alignment=Qt.AlignCenter)
 
         # Tooltip
@@ -296,6 +340,7 @@ class InspectionWindow(QDialog):
             print("⚠️ set_controls após start falhou:", e)
 
         print("[INFO] Controles da câmara aplicados:", controls)
+        self._set_status("Câmara inicializada.")
 
         # Carrega template e máscara
         self.template_full = cv2.imread(self.template_path)
@@ -348,6 +393,20 @@ class InspectionWindow(QDialog):
         # Mostra template inicial
         self.show_image(self.template_full)
 
+        # Elapsed time timer (1 Hz)
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.setInterval(1000)
+        self.elapsed_timer.timeout.connect(self._update_elapsed_time)
+        self._elapsed_start_ts = None
+        self._elapsed_seconds = 0
+
+        # Atalhos de teclado
+        QShortcut(QKeySequence("T"), self, activated=lambda: self._shortcut_toggle(self.toggle_template))
+        QShortcut(QKeySequence("B"), self, activated=lambda: self._shortcut_toggle(self.toggle_bw))
+        QShortcut(QKeySequence("C"), self, activated=lambda: self._shortcut_toggle(self.toggle_contours))
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_tuner_window)
+        QShortcut(QKeySequence("Q"), self, activated=self.close)
+
     # ----------------- Funções -----------------
     def capture_picam_frame(self):
         frame = self.picam2.capture_array("main")
@@ -365,7 +424,7 @@ class InspectionWindow(QDialog):
         h, w, ch = img_rgb.shape
         qimg = QImage(img_rgb.data, w, h, int(img_rgb.strides[0]), QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
-        pixmap = pixmap.scaled(self.frame_img.width(), self.frame_img.height(), Qt.KeepAspectRatio)
+        pixmap = pixmap.scaled(self.frame_img.width(), self.frame_img.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.frame_img.setPixmap(pixmap)
         self.frame_img.setAlignment(Qt.AlignCenter)
 
@@ -406,21 +465,14 @@ class InspectionWindow(QDialog):
             img = self._to_gray_bgr(base) if bw else base
             self.show_image(img)
 
-    def _toggle_image(self):
-        self._refresh_view()
-
     def _toggle_defect_contours(self):
         self._refresh_view()
 
     def _toggle_bw(self):
         self._refresh_view()
 
-
-    def _toggle_defect_contours(self):
-        if self.toggle_contours.isChecked() and self.defect_contours:
-            self.show_image(self.aligned_full, draw_contours=self.defect_contours)
-        else:
-            self.show_image(self.aligned_full)
+    def _shortcut_toggle(self, switch_widget):
+        switch_widget.setChecked(not switch_widget.isChecked())
 
     def _load_params(self):
         params = load_params("config/inspection_params.json") or {}
@@ -762,6 +814,7 @@ class InspectionWindow(QDialog):
         self.last_vis_bw    = vis_bw
         self.last_vis_color = vis_color
         self._refresh_view()
+        self._set_status(f"Inspeção concluída: {len(defect_data)} defeitos em {cans_with_defects} latas.")
 
     def open_tuner_window(self):
         # 1) capturar frame atual
@@ -778,6 +831,83 @@ class InspectionWindow(QDialog):
         # 4) abrir o Tuner com imagens realmente diferentes
         tuner = DefectTunerWindow(self, tpl_m, ali_m, self.mask_full, self.user_type, self.user)
         tuner.exec()
+
+    def _start_timer(self):
+        if self.elapsed_timer.isActive():
+            return
+        # resume from last elapsed seconds
+        now = time.time()
+        self._elapsed_start_ts = now - int(self._elapsed_seconds)
+        self.elapsed_timer.start()
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setEnabled(False)
+        if hasattr(self, 'btn_stop'):
+            self.btn_stop.setEnabled(True)
+        self._set_status("Cronómetro iniciado.")
+
+    def _stop_timer(self):
+        if not self.elapsed_timer.isActive():
+            return
+        self.elapsed_timer.stop()
+        # finalize elapsed_seconds snapshot
+        if self._elapsed_start_ts is not None:
+            self._elapsed_seconds = max(0, int(time.time() - self._elapsed_start_ts))
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setEnabled(True)
+        if hasattr(self, 'btn_stop'):
+            self.btn_stop.setEnabled(False)
+        self._set_status("Cronómetro parado.")
+
+    def _update_elapsed_time(self):
+        if self._elapsed_start_ts is None:
+            return
+        secs = max(0, int(time.time() - self._elapsed_start_ts))
+        self._elapsed_seconds = secs
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        try:
+            self.systemElapsedTime.update_value(f"{h:02d}:{m:02d}:{s:02d}")
+        except Exception:
+            pass
+
+    # Continuous inspection removed by request; use single-run button only
+
+    def _reset_counters(self):
+        self.count_sheets = 0
+        self.count_total_cans = 0
+        self.count_good_cans = 0
+        self.count_defect_cans = 0
+        self.systemTotalSheets.set_value(0)
+        self.systemTotalCans.set_value(0)
+        self.systemGoodCans.set_value(0)
+        self.systemTotalDefects.set_value(0)
+        self.systemDefectPercent.set_value("0.0%")
+        self.systemCansDefects.update_value("—")
+        self._set_status("Contadores resetados.")
+
+    def _save_snapshot(self):
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            img = None
+            if self.toggle_contours.isChecked():
+                img = self.last_vis_bw if self.toggle_bw.isChecked() else self.last_vis_color
+            if img is None:
+                img = self.last_aligned if self.last_aligned is not None else self.current_full
+            out_dir = os.path.join("logs", "snapshots")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"snapshot_{ts}.png")
+            cv2.imwrite(out_path, img)
+            self._set_status(f"Snapshot guardado: {out_path}")
+        except Exception as e:
+            print("Erro a guardar snapshot:", e)
+            self._set_status("Falha ao guardar snapshot.")
+
+    def _set_status(self, text: str):
+        try:
+            self.status_label.setText(text)
+        except Exception:
+            pass
 
 
     def closeEvent(self, event):
