@@ -152,6 +152,9 @@ def detect_defects(tpl, aligned, mask,
                    msssim_morph_iterations=1,
                    # ---- Overexposure handling ----
                    ignore_overexposed=False,
+                   # ---- ROI/border handling ----
+                   roi_erode_px=2,
+                   suppress_border_width_px=0,
                    # ---- NOVO: Morfologia L (top/black) ----
                    use_morph_maps=True,
                    th_top_percentile=99.5,
@@ -187,7 +190,15 @@ def detect_defects(tpl, aligned, mask,
         mask_bin = (mask > 0).astype(np.uint8) * 255
     else:
         mask_bin = mask
-    safe_roi = cv2.erode(mask_bin, np.ones((5,5), np.uint8), 1)  # afasta borda
+    # ROI seguro: afasta borda configurável
+    try:
+        erode_px = max(0, int(roi_erode_px))
+    except Exception:
+        erode_px = 0
+    k_safe = 2 * erode_px + 1
+    if k_safe < 1:
+        k_safe = 1
+    safe_roi = cv2.erode(mask_bin, np.ones((k_safe, k_safe), np.uint8), 1)
 
     # --- Grayscale base (sem CLAHE) + desfoque leve ---
     t_gray = cv2.cvtColor(tpl,     cv2.COLOR_BGR2GRAY)
@@ -418,6 +429,16 @@ def detect_defects(tpl, aligned, mask,
 
     combined_fused = cv2.bitwise_or(combined, fused_mask)
     final_defect_mask = cv2.bitwise_and(combined_fused, combined_fused, mask=safe_roi)
+    # opcional: suprimir anel de borda da máscara (para evitar falsos na fronteira)
+    try:
+        border_w = max(0, int(suppress_border_width_px))
+    except Exception:
+        border_w = 0
+    if border_w > 0:
+        k_border = 2 * border_w + 1
+        inner = cv2.erode(mask_bin, np.ones((k_border, k_border), np.uint8), 1)
+        border_ring = cv2.subtract(mask_bin, inner)
+        final_defect_mask = cv2.bitwise_and(final_defect_mask, cv2.bitwise_not(border_ring))
     if ignore_overexposed and over_mask is not None:
         final_defect_mask = cv2.bitwise_and(final_defect_mask, cv2.bitwise_not(over_mask))
 

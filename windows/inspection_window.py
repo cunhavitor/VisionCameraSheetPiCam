@@ -367,14 +367,21 @@ class InspectionWindow(QDialog):
         self.tpl_gray_eq = self.clahe.apply(cv2.GaussianBlur(tpl_gray, (3, 3), 0))
         self.tpl_lab = cv2.cvtColor(self.template_full, cv2.COLOR_BGR2LAB)
 
+        # Carrega parâmetros primeiro (para usar margem ROI)
+        self._load_params()
+
         # ROI seguro (afasta borda da máscara) + cache bbox
-        self.safe_mask = cv2.erode(self.mask_full, np.ones((5,5), np.uint8), 1)
+        try:
+            erode_px = max(0, int(getattr(self, 'roi_erode_px', 2)))
+        except Exception:
+            erode_px = 0
+        k = 2 * erode_px + 1
+        if k < 1:
+            k = 1
+        self.safe_mask = cv2.erode(self.mask_full, np.ones((k,k), np.uint8), 1)
         nz = cv2.findNonZero(self.safe_mask)
         x0, y0, w0, h0 = cv2.boundingRect(nz) if nz is not None else (0, 0, self.mask_full.shape[1], self.mask_full.shape[0])
         self._mask_bbox = (x0, y0, w0, h0)
-
-        # Carrega parâmetros
-        self._load_params()
 
         # Carrega forma_base e instâncias
         self.instancias_poligonos = []
@@ -568,6 +575,14 @@ class InspectionWindow(QDialog):
             setattr(self, attr, max(0.0, min(1.0, float(v))))
         self.fused_percentile = max(0.0, min(100.0, self.fused_percentile))
 
+        # ---- ROI / Border handling ----
+        self.roi_erode_px = int(params.get("roi_erode_px", 2))
+        self.roi_erode_px = max(0, self.roi_erode_px)
+        self.suppress_border_width_px = int(params.get("suppress_border_width_px", 0))
+        self.suppress_border_width_px = max(0, self.suppress_border_width_px)
+        # overexposed handling
+        self.ignore_overexposed = bool(int(params.get("ignore_overexposed", params.get("ignore_overexposed", 0))))
+
         # ---- clamps básicos úteis ----
         self.dark_threshold   = max(0, min(255, self.dark_threshold))
         self.bright_threshold = max(0, min(255, self.bright_threshold))
@@ -691,6 +706,11 @@ class InspectionWindow(QDialog):
             msssim_sigmas=self.msssim_sigmas,
             msssim_morph_kernel_size=self.msssim_morph_kernel_size,
             msssim_morph_iterations=self.msssim_morph_iterations,
+            # ---- ROI / Borders ----
+            roi_erode_px=self.roi_erode_px,
+            suppress_border_width_px=self.suppress_border_width_px,
+            # ---- Overexposed ----
+            ignore_overexposed=self.ignore_overexposed,
             # ---- Mapas adicionais + Fusão ----
             use_morph_maps=self.use_morph_maps,
             th_top_percentile=self.th_top_percentile,

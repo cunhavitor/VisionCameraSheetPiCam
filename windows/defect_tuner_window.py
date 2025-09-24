@@ -90,6 +90,10 @@ class DefectTunerWindow(QDialog):
         "use_heatmap_bg": 1,
         # Overexposure ignore (glare/white saturation)
         "ignore_overexposed": 0
+        ,
+        # ROI / Border handling
+        "roi_erode_px": 2,
+        "suppress_border_width_px": 0
         }
 
         # ⬇️ carregar valores guardados (antes de criares os spinboxes)
@@ -137,7 +141,9 @@ class DefectTunerWindow(QDialog):
             "final_mode": "Como calcular o mapa Final: clássico (união dos 4 mapas) ou estendido (com fusão).",
             "final_include_gradient": "Se ligado, inclui o mapa de Gradiente na máscara Final (modo clássico).",
             "use_heatmap_bg": "Usa o mapa de calor do diff escuro (CLAHE) como fundo.",
-            "ignore_overexposed": "Ignora zonas muito claras/brancas (reflexos/saturação) ao contabilizar defeitos."
+            "ignore_overexposed": "Ignora zonas muito claras/brancas (reflexos/saturação) ao contabilizar defeitos.",
+            "roi_erode_px": "Encolhe a máscara para longe das bordas (px) para reduzir falsos perto da fronteira.",
+            "suppress_border_width_px": "Largura do anel na borda da máscara a ignorar completamente (px)."
         }
 
         # --- Layout principal: vertical (topo com 3 colunas + barra inferior) ---
@@ -227,6 +233,10 @@ class DefectTunerWindow(QDialog):
         add_spin("Gradiente Escuro (CLAHE)", "dark_gradient_threshold", 0, 255, f_basic)
         add_spin("Área mínima do defeito", "min_defect_area", 1, 100000, f_basic)
         add_check("Ignorar zonas superexpostas", "ignore_overexposed", f_basic)
+        # ROI / Border controls
+        f_roi = add_section("ROI / Borda", basics_v)
+        add_spin("Margem ROI (erode px)", "roi_erode_px", 0, 30, f_roi)
+        add_spin("Suprimir anel de borda (px)", "suppress_border_width_px", 0, 30, f_roi)
         basics_idx = tabs.addTab(basics_page, "🧩 Basics")
         tabs.setTabToolTip(basics_idx, "Parâmetros gerais para calibrar sensibilidade e tamanho mínimo de defeitos.")
         self._basics_v = basics_v
@@ -843,6 +853,9 @@ class DefectTunerWindow(QDialog):
             msssim_morph_iterations=int(self.params["msssim_morph_iterations"]),
             # ---- Overexposure ----
             ignore_overexposed=bool(int(self.params.get("ignore_overexposed", 0))),
+            # ---- ROI / Borders ----
+            roi_erode_px=int(self.params.get("roi_erode_px", 2)),
+            suppress_border_width_px=int(self.params.get("suppress_border_width_px", 0)),
             # ---- Mapas adicionais + Fusão ----
             use_morph_maps=(False if _classic else bool(int(self.params["use_morph_maps"]))),
             th_top_percentile=float(self.params["th_top_percentile"]),
@@ -1117,6 +1130,8 @@ class DefectTunerWindow(QDialog):
             "dark_morph_kernel_size","dark_morph_iterations",
             "bright_morph_kernel_size","bright_morph_iterations",
             "dark_gradient_threshold","min_defect_area","detect_area","ignore_overexposed","use_heatmap_bg",
+            # ROI/Borders
+            "roi_erode_px","suppress_border_width_px",
             # novos MS-SSIM
             "use_ms_ssim","msssim_percentile","msssim_weight",
             "msssim_kernel_size_s1","msssim_kernel_size_s2","msssim_kernel_size_s3",
@@ -1125,7 +1140,9 @@ class DefectTunerWindow(QDialog):
             # novos mapas/fusão
             "use_morph_maps","th_top_percentile","th_black_percentile","se_top","se_black",
             "use_color_delta","color_metric","color_percentile",
-            "fusion_mode","w_struct","w_top","w_black","w_color","fused_percentile"
+            "fusion_mode","w_struct","w_top","w_black","w_color","fused_percentile",
+            # finais
+            "final_mode","final_include_gradient"
         ]
 
         row_dict = {
@@ -1136,7 +1153,7 @@ class DefectTunerWindow(QDialog):
         }
 
         with open(log_path, mode="a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=field_order, delimiter=';')
+            writer = csv.DictWriter(csvfile, fieldnames=field_order, delimiter=';', extrasaction='ignore')
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row_dict)

@@ -11,6 +11,23 @@ from PySide6.QtGui import QPixmap, QImage, QColor
 from PIL import Image, ImageDraw, ImageQt
 from picamera2 import Picamera2
 
+
+def _order_clockwise(pts):
+    """Ordena 4 pontos (x, y) no sentido horário, iniciando pelo topo-esquerda.
+    Aceita qualquer iterável de 4 tuplos. Retorna lista de 4 tuplos.
+    """
+    if pts is None or len(pts) < 4:
+        return pts
+    pts_np = np.array(pts, dtype=np.float32)
+    s = pts_np.sum(axis=1)
+    diff = np.diff(pts_np, axis=1)[:, 0]
+    tl = pts_np[np.argmin(s)]
+    br = pts_np[np.argmax(s)]
+    tr = pts_np[np.argmin(diff)]
+    bl = pts_np[np.argmax(diff)]
+    ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+    return [(int(p[0]), int(p[1])) for p in ordered]
+
 from config.config import PREVIEW_WIDTH, PREVIEW_HEIGHT
 
 
@@ -162,6 +179,10 @@ class AlignmentWindow(QDialog):
         x_min, x_max = self.x_min_slider.value(), self.x_max_slider.value()
         y_min, y_max = self.y_min_slider.value(), self.y_max_slider.value()
 
+        # Garantir que limites estão ordenados
+        x_min, x_max = (x_min, x_max) if x_min <= x_max else (x_max, x_min)
+        y_min, y_max = (y_min, y_max) if y_min <= y_max else (y_max, y_min)
+
         # retângulo semi-transparente verde
         draw.rectangle([(x_min, y_min), (x_max, y_max)], outline=(0, 255, 0, 255), width=3, fill=(0, 255, 0, 60))
 
@@ -172,6 +193,19 @@ class AlignmentWindow(QDialog):
 
         pil_img = Image.alpha_composite(pil_img, mask_colored)
 
+        # Detectar contorno da folha dentro do ROI e desenhar
+        try:
+            contour_pts = self._detect_sheet_contour(frame_rgb, x_min, y_min, x_max, y_max)
+            if contour_pts is not None and len(contour_pts) >= 4:
+                # Desenhar polígono em azul
+                pts = [(int(x), int(y)) for (x, y) in contour_pts]
+                draw.line(pts + [pts[0]], fill=(50, 150, 255, 255), width=3)
+                self.status_label.setText("[INFO] Contorno da folha detetado")
+            else:
+                self.status_label.setText("[INFO] Sem contorno de folha claro no ROI")
+        except Exception:
+            # Evitar crash caso algo falhe
+            self.status_label.setText("[INFO] Falha na deteção de contorno")
 
         # cálculo densidade
         try:
@@ -188,6 +222,73 @@ class AlignmentWindow(QDialog):
         qt_img = ImageQt.ImageQt(final_img.convert("RGB"))
         pixmap = QPixmap.fromImage(qt_img)
         self.image_label.setPixmap(pixmap)
+
+    def _detect_sheet_contour(self, frame_rgb, x_min, y_min, x_max, y_max):
+        """
+        Deteta o contorno principal (preferencialmente quadrilátero) da folha dentro do ROI.
+        Retorna uma lista de 4 pontos (x, y) no espaço da imagem completa, ou None se não encontrado.
+        """
+        # Recortar ROI com segurança
+        h, w = frame_rgb.shape[:2]
+        x_min = max(0, min(w - 1, x_min))
+        x_max = max(0, min(w - 1, x_max))
+        y_min = max(0, min(h - 1, y_min))
+        y_max = max(0, min(h - 1, y_max))
+
+        if x_max - x_min < 10 or y_max - y_min < 10:
+            return None
+
+        roi = frame_rgb[y_min:y_max, x_min:x_max]
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Primeiro tentar Canny + dilatação
+        edges = cv2.Canny(blur, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Fallback: tentar binarização Otsu se não encontrar nada robusto
+        if len(contours) == 0:
+            _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if len(contours) == 0:
+            return None
+
+        roi_area = (x_max - x_min) * (y_max - y_min)
+        best_quad = None
+        best_area = 0
+        best_rect = None
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 0.05 * roi_area:  # ignorar muito pequenos
+                continue
+
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) == 4:
+                if area > best_area:
+                    best_area = area
+                    best_quad = approx.reshape(-1, 2)
+            else:
+                # Guardar melhor retângulo rotacionado como fallback
+                rect = cv2.minAreaRect(cnt)
+                box = cv2.boxPoints(rect)
+                box = np.int0(box)
+                if area > best_area:
+                    best_area = area
+                    best_rect = box
+
+        if best_quad is not None:
+            pts = [(int(x_min + p[0]), int(y_min + p[1])) for p in best_quad]
+            return _order_clockwise(pts)
+        if best_rect is not None:
+            pts = [(int(x_min + p[0]), int(y_min + p[1])) for p in best_rect]
+            return _order_clockwise(pts)
+
+        return None
 
     def _update_alignment(self):
         self._initialize_mask()
